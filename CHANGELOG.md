@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-24
+
+### Added
+
+- `DurableBullRootOptions.stateStore` — supply a shared `StateStore` for the
+  whole NestJS module (e.g. an existing client, or a `MemoryStateStore` in tests).
+
+### Changed
+
+- NestJS: every queue and worker now reuses a single shared `StateStore`, so an
+  app with N queues/workers opens one Redis state connection instead of N.
+
+### Fixed
+
+- `DurableQueue.cancel()` removes the pending resume job by its exact id instead
+  of scanning the entire BullMQ delayed set — constant-time regardless of how
+  many delayed jobs the queue holds.
+
 ## [0.1.0] - 2026-06-23
 
 ### Added

@@ -19,6 +19,7 @@ import {
   InjectDurableQueue,
 } from "../src/nestjs/index"
 import type { DurableWorkerFactory } from "../src/nestjs/types"
+import { MemoryStateStore } from "../src/index"
 
 const CONNECTION = { host: "127.0.0.1", port: 6379 } as ConnectionOptions
 
@@ -199,6 +200,7 @@ describe("DurableBullModule", () => {
   })
 
   it("wires injectable queues and discovers processors end to end", async () => {
+    const store = new MemoryStateStore()
     const started: string[] = []
     const factory: DurableWorkerFactory = (queueName) => {
       started.push(queueName)
@@ -207,7 +209,7 @@ describe("DurableBullModule", () => {
 
     const moduleRef = await Test.createTestingModule({
       imports: [
-        DurableBullModule.forRoot({ connection: CONNECTION, global: true }),
+        DurableBullModule.forRoot({ connection: CONNECTION, global: true, stateStore: store }),
         DurableBullModule.registerQueue({ name: "generation", concurrency: 3 }),
       ],
       providers: [
@@ -220,13 +222,50 @@ describe("DurableBullModule", () => {
     // Trigger onModuleInit so the explorer runs.
     await moduleRef.init()
 
-    const queue = moduleRef.get(getDurableQueueToken("generation"), { strict: false })
+    const queue = moduleRef.get<DurableQueue>(getDurableQueueToken("generation"), { strict: false })
     expect(queue).toBeInstanceOf(DurableQueue)
+    expect(queue.stateStore).toBe(store)
 
     const service = moduleRef.get(GenerationService)
     expect(service.queue).toBeInstanceOf(DurableQueue)
 
     expect(started).toContain("generation")
+
+    await moduleRef.close()
+  })
+
+  it("shares one StateStore (and connection) across every queue and worker", async () => {
+    const store = new MemoryStateStore()
+    const workerOptions: Array<{ stateStore?: unknown }> = []
+    const factory: DurableWorkerFactory = (_queueName, _processor, options) => {
+      workerOptions.push(options)
+      return { close: async () => undefined }
+    }
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableBullModule.forRoot({ connection: CONNECTION, stateStore: store }),
+        DurableBullModule.registerQueue({ name: "generation" }, { name: "media" }),
+      ],
+      providers: [
+        { provide: DURABLE_WORKER_FACTORY, useValue: factory },
+        GenerationProcessor,
+        MediaProcessor,
+      ],
+    }).compile()
+    await moduleRef.init()
+
+    // Two processors -> two workers, each handed the same store instance.
+    expect(workerOptions).toHaveLength(2)
+    for (const options of workerOptions) {
+      expect(options.stateStore).toBe(store)
+    }
+
+    // The injectable queues reuse it as well.
+    const gen = moduleRef.get<DurableQueue>(getDurableQueueToken("generation"), { strict: false })
+    const media = moduleRef.get<DurableQueue>(getDurableQueueToken("media"), { strict: false })
+    expect(gen.stateStore).toBe(store)
+    expect(media.stateStore).toBe(store)
 
     await moduleRef.close()
   })

@@ -1,6 +1,6 @@
 {
   "name": "bullmq-durable",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Durable execution for BullMQ jobs. Checkpoint, retry, sleep, and resume long-running jobs with a simple step API.",
   "type": "module",
   "license": "MIT",

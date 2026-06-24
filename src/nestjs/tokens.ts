@@ -5,6 +5,9 @@
 /** Injection token holding the root {@link DurableBullRootOptions}. */
 export const DURABLE_BULL_OPTIONS = Symbol("DURABLE_BULL_OPTIONS")
 
+/** Injection token holding the shared {@link StateStore} reused by every queue/worker. */
+export const DURABLE_STATE_STORE = Symbol("DURABLE_STATE_STORE")
+
 /** Optional injection token overriding how workers are constructed (tests). */
 export const DURABLE_WORKER_FACTORY = Symbol("DURABLE_WORKER_FACTORY")
 

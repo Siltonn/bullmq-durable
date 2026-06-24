@@ -132,25 +132,35 @@ export class DurableQueue<TJobs extends DurableJobMap = DurableJobMap> implement
 
   /**
    * Cancel a durable instance. Marks it cancelled (so any future tick stops at
-   * the next step) and best-effort removes pending delayed/resume jobs.
+   * the next step) and best-effort removes the pending original/resume jobs.
+   *
+   * Removal is by exact job id, never a scan of the delayed set: that set can
+   * hold tens of thousands of jobs in a sleep/poll-heavy system, and only the
+   * latest resume tick (id derived from `instance.resumeSeq`) can ever be
+   * pending. Correctness does not rely on the removal — any resume that still
+   * fires observes the cancelled status and stops at its next step.
    */
   async cancel(jobId: string | number): Promise<void> {
     const instanceId = this.instanceIdFor(jobId)
     await this.stateStore.cancelInstance(instanceId)
+    const instance = await this.stateStore.getInstance(instanceId)
 
     try {
-      const original = await this.bull.getJob(String(jobId))
-      if (original) await original.remove().catch(() => undefined)
+      await this.removeJob(String(jobId))
 
-      const delayed = await this.bull.getDelayed()
-      await Promise.all(
-        delayed
-          .filter((job) => job.id?.startsWith(`${jobId}:resume:`))
-          .map((job) => job.remove().catch(() => undefined)),
-      )
+      const resumeSeq = instance?.resumeSeq ?? 0
+      if (resumeSeq > 0) {
+        await this.removeJob(resumeJobId(instance?.originalJobId || String(jobId), resumeSeq))
+      }
     } catch {
       // Best effort: the instance is already marked cancelled either way.
     }
+  }
+
+  /** Remove a BullMQ job by id if it exists, swallowing lock/availability errors. */
+  private async removeJob(id: string): Promise<void> {
+    const job = await this.bull.getJob(id)
+    if (job) await job.remove().catch(() => undefined)
   }
 
   /** Close the underlying queue and any store we created. */

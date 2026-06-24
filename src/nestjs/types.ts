@@ -3,6 +3,7 @@
  */
 
 import type { ConnectionOptions, JobsOptions } from "bullmq"
+import type { StateStore } from "../store/state-store"
 import type {
   DurableJobMap,
   DurableProcessorInput,
@@ -17,6 +18,12 @@ export interface DurableBullRootOptions {
   connection: ConnectionOptions
   /** Register the module globally (default `true`). */
   global?: boolean
+  /**
+   * A custom store shared by every queue and worker. When omitted, the module
+   * creates a single {@link import("../store/redis-store").RedisStateStore} from
+   * `connection` and shares that — so all queues/workers use one connection.
+   */
+  stateStore?: StateStore
   durablePrefix?: string
   bullPrefix?: string
   // Defaults applied to every worker unless overridden per queue.

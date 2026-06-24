@@ -260,6 +260,48 @@ maxmemory-policy noeviction
 ledgers, payments, subscriptions, asset records, refunds, payouts). Treat the
 Redis durable state as an execution checkpoint, not the source of truth.
 
+### Connections
+
+By default, every `DurableQueue` / `DurableWorker` that isn't given an explicit
+`stateStore` opens **its own** `RedisStateStore` (one ioredis connection). Two
+things keep this in check:
+
+- A `DurableWorker` shares its store with its internal resume queue, so it never
+  double-opens.
+- A producer-only `DurableQueue` is lazy — it opens a state connection only when
+  you call `getDurableState` / `getDurableSteps` / `getDurableLogs` / `cancel`.
+  A queue that only ever calls `add()` opens none.
+
+(BullMQ itself also opens a connection per `Queue`/`Worker` — a worker's blocking
+connection can't be shared — so some connections are inherent to BullMQ.)
+
+If you run **many** durable queues/workers against a connection-limited Redis
+(Upstash, ElastiCache), share one store explicitly so they use a single state
+connection:
+
+```ts
+import { DurableQueue, DurableWorker, RedisStateStore } from "bullmq-durable"
+
+const stateStore = new RedisStateStore({ connection })
+
+const queue = new DurableQueue("gen", { connection, stateStore })
+new DurableWorker("a", procA, { connection, stateStore })
+new DurableWorker("b", procB, { connection, stateStore })
+// ↑ N components, one shared state connection
+```
+
+The store multiplexes ordinary Redis commands over one socket, so sharing it
+across many workers is safe. **In NestJS this is automatic** — `forRoot` builds
+one shared store and injects it into every queue and worker it wires up. Pass
+your own to reuse an existing client (or a `MemoryStateStore` in tests):
+
+```ts
+DurableBullModule.forRoot({ connection, stateStore: myStore })
+```
+
+(A `registerQueue` that overrides `durablePrefix` to a different value keeps its
+own store, since one store maps to one key prefix.)
+
 ## 9. NestJS integration
 
 A NestJS adapter ships behind the `bullmq-durable/nestjs` subpath. It mirrors

@@ -15,12 +15,15 @@ import {
   Optional,
 } from "@nestjs/common"
 import { DiscoveryService, ModuleRef, Reflector } from "@nestjs/core"
+import type { StateStore } from "../store/state-store"
 import { DurableWorker } from "../worker"
 import type { DurableProcessor, DurableWorkerOptions } from "../types"
+import { reuseSharedStore } from "./shared-store"
 import {
   DURABLE_BULL_OPTIONS,
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,
+  DURABLE_STATE_STORE,
   DURABLE_WORKER_FACTORY,
   getDurableQueueOptionsToken,
 } from "./tokens"
@@ -49,6 +52,10 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
     @Optional()
     @Inject(DURABLE_WORKER_FACTORY)
     private readonly explicitFactory?: DurableWorkerFactory,
+    // The module-wide store, reused by every worker so they share one connection.
+    @Optional()
+    @Inject(DURABLE_STATE_STORE)
+    private readonly sharedStore?: StateStore,
   ) {}
 
   onModuleInit(): void {
@@ -88,6 +95,13 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     await Promise.all(this.workers.map((worker) => worker.close().catch(() => undefined)))
     this.workers.length = 0
+
+    // Close the shared store only when we created it; a user-supplied store is
+    // theirs to manage. (Workers receive the shared store but never own it.)
+    const root = this.get<DurableBullRootOptions>(DURABLE_BULL_OPTIONS)
+    if (this.sharedStore && this.sharedStore !== root?.stateStore) {
+      await this.sharedStore.close().catch(() => undefined)
+    }
   }
 
   /** Number of workers started — handy for assertions in tests. */
@@ -147,6 +161,7 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
       retention: queue?.retention ?? root.retention,
       defaultStepOptions: queue?.defaultStepOptions ?? root.defaultStepOptions,
       maxLogs: queue?.maxLogs ?? root.maxLogs,
+      stateStore: reuseSharedStore(this.sharedStore, root, queue?.durablePrefix),
     }
   }
 

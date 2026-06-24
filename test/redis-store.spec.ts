@@ -200,6 +200,44 @@ describeRedis("RedisStateStore (integration)", () => {
     }
   })
 
+  it("cancel() removes the pending resume job by exact id (no delayed-set scan)", async () => {
+    const queue = new DurableQueue("rq-cancel", {
+      connection: { host: REDIS_HOST, port: REDIS_PORT },
+      stateStore: store,
+    })
+    try {
+      const instanceId = queue.instanceIdFor("1")
+      await store.initInstance({
+        instanceId,
+        queueName: "rq-cancel",
+        jobName: "job",
+        jobId: "1",
+        input: {},
+      })
+      // Simulate one yield: allocate resumeSeq=1 and enqueue its delayed resume.
+      await store.nextResumeSeq(instanceId)
+      await queue.scheduleResume({
+        instanceId,
+        queueName: "rq-cancel",
+        jobName: "job",
+        jobData: {},
+        originalJobId: "1",
+        resumeSeq: 1,
+        delayMs: 60_000,
+        reason: "test",
+      })
+      expect(await queue.bull.getJob("1:resume:1")).toBeTruthy()
+
+      await queue.cancel("1")
+
+      expect(await queue.bull.getJob("1:resume:1")).toBeFalsy()
+      expect((await store.getInstance(instanceId))?.status).toBe("cancelled")
+    } finally {
+      await queue.bull.obliterate({ force: true })
+      await queue.close()
+    }
+  })
+
   it("drives a full durable flow (step + sleep + retry) end to end", async () => {
     // `polls` lives across ticks: each resume re-enters the processor and the
     // poll step is retried until the condition holds.
