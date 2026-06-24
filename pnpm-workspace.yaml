@@ -1,0 +1,11 @@
+# pnpm 11 reads project settings from this file (no longer from package.json).
+#
+# None of these dependencies need their install/build scripts, so we decline
+# them all (keeps `pnpm install` and the pre-run deps check clean):
+#  - esbuild ships a prebuilt per-platform binary package (@esbuild/<platform>)
+#  - msgpackr-extract falls back to a pure-JS implementation
+#  - @nestjs/core's postinstall only prints a funding notice
+allowBuilds:
+  "@nestjs/core": false
+  esbuild: false
+  msgpackr-extract: false

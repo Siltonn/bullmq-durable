@@ -1,0 +1,31 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-06-23
+
+### Added
+
+- Initial release.
+- `DurableQueue` and `DurableWorker` — thin wrappers over BullMQ whose processor
+  receives a durable context: `processor(job, ctx)`.
+- Durable context API: `ctx.step` (run-once, checkpointed), `ctx.sleep` /
+  `ctx.sleepUntil` (yield without holding a worker), `ctx.retryLater`,
+  `ctx.nonRetryable`, `ctx.log`, and `ctx.stepId`.
+- Per-step retry policy with `fixed` / `exponential` backoff, optional `maxDelay`,
+  and worker-level `defaultStepOptions`.
+- `RedisStateStore` (default) and `MemoryStateStore`, plus a pluggable
+  `StateStore` interface for custom backends.
+- Per-instance advisory locking with heartbeat renewal, retention TTLs,
+  cancellation, and bounded structured logs.
+- Queue inspection helpers: `getDurableState`, `getDurableSteps`,
+  `getDurableLogs`, and `cancel`.
+- Optional NestJS integration under `bullmq-durable/nestjs`: `DurableBullModule`,
+  `@DurableProcessor`, `@DurableProcess`, and `@InjectDurableQueue`.
+- Dual ESM/CJS build with type declarations, end-to-end TypeScript job-map
+  inference, and a comprehensive test suite.
