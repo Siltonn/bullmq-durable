@@ -12,7 +12,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22]
+        # pnpm 11 (our pinned packageManager) requires Node >= 22.13, so the dev
+        # toolchain runs on 22+. The published library still supports Node >= 18
+        # at runtime (no Node 22-only APIs are used in src/).
+        node-version: [22, 24]
 
     services:
       redis:

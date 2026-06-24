@@ -437,7 +437,9 @@ retried rather than stranding the instance.
 
 ## Development
 
-This repo uses [pnpm](https://pnpm.io).
+This repo uses [pnpm](https://pnpm.io) 11, which requires **Node ≥ 22**. (The
+published library itself supports Node ≥ 18 at runtime — only the dev toolchain
+needs 22+.)
 
 ```bash
 pnpm install
