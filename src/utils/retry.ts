@@ -33,6 +33,13 @@ export function resolveRetry(step?: RetryOptions, fallback?: RetryOptions): Reso
 }
 
 /**
+ * Default ceiling for exponential backoff when no explicit `maxDelay` is given.
+ * Without a cap, `delay * 2 ** attempt` quickly reaches absurd (or `Infinity`)
+ * values, which would push the resume job astronomically far into the future.
+ */
+export const DEFAULT_MAX_BACKOFF_MS = 3_600_000 // 1 hour
+
+/**
  * Compute the delay before the next attempt.
  *
  * @param failedAttempt 1-based count of the attempt that just failed (so `1`
@@ -43,8 +50,12 @@ export function computeBackoff(retry: ResolvedRetry, failedAttempt: number): num
   if (retry.backoff === "exponential") {
     delay = retry.delayMs * 2 ** Math.max(0, failedAttempt - 1)
   }
-  if (retry.maxDelayMs !== undefined) {
-    delay = Math.min(delay, retry.maxDelayMs)
+  // Exponential backoff is always capped — by the caller's `maxDelay` if set,
+  // otherwise by a sane default — so the delay can never explode to Infinity.
+  const cap =
+    retry.maxDelayMs ?? (retry.backoff === "exponential" ? DEFAULT_MAX_BACKOFF_MS : undefined)
+  if (cap !== undefined) {
+    delay = Math.min(delay, cap)
   }
   return delay
 }

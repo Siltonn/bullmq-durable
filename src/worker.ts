@@ -56,6 +56,7 @@ export class DurableWorker<TJobs extends DurableJobMap = DurableJobMap> {
       bullPrefix: options.bullPrefix,
       durablePrefix: options.durablePrefix,
       stateStore: this.store,
+      resumeAttempts: options.resumeAttempts,
     })
 
     this.lockTimeoutMs = parseDuration(options.lockTimeout ?? DEFAULT_LOCK_TIMEOUT)

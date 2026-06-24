@@ -98,22 +98,31 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
   /** Build a `{ jobName: boundMethod }` map from `@DurableProcess` methods. */
   private buildHandlerMap(instance: object): Record<string, DurableProcessor> {
     const handlers: Record<string, DurableProcessor> = {}
-    const prototype = Object.getPrototypeOf(instance) as Record<string, unknown>
+    const seen = new Set<string>()
 
-    for (const propertyName of Object.getOwnPropertyNames(prototype)) {
-      if (propertyName === "constructor") continue
-      const method = prototype[propertyName]
-      if (typeof method !== "function") continue
+    // Walk the whole prototype chain so `@DurableProcess` methods inherited from
+    // a base class are discovered too. A more-derived method shadows a base one
+    // of the same name (we visit derived prototypes first).
+    let prototype = Object.getPrototypeOf(instance) as Record<string, unknown> | null
+    while (prototype && prototype !== Object.prototype) {
+      for (const propertyName of Object.getOwnPropertyNames(prototype)) {
+        if (propertyName === "constructor" || seen.has(propertyName)) continue
+        seen.add(propertyName)
 
-      const processMeta = this.reflector.get<DurableProcessMetadata>(
-        DURABLE_PROCESS_METADATA,
-        method,
-      )
-      if (!processMeta) continue
+        const method = prototype[propertyName]
+        if (typeof method !== "function") continue
 
-      handlers[processMeta.jobName] = (method as DurableProcessor).bind(
-        instance,
-      ) as DurableProcessor
+        const processMeta = this.reflector.get<DurableProcessMetadata>(
+          DURABLE_PROCESS_METADATA,
+          method,
+        )
+        if (!processMeta) continue
+
+        handlers[processMeta.jobName] = (method as DurableProcessor).bind(
+          instance,
+        ) as DurableProcessor
+      }
+      prototype = Object.getPrototypeOf(prototype) as Record<string, unknown> | null
     }
 
     return handlers

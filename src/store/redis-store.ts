@@ -2,10 +2,10 @@
  * Redis-backed {@link StateStore} — the default, production implementation.
  *
  * Layout (see {@link import("../utils/keys")}):
- *  - `{prefix}:instance:{id}`        Hash  — instance fields
- *  - `{prefix}:instance:{id}:steps`  Hash  — stepKey -> JSON(StepState)
- *  - `{prefix}:instance:{id}:logs`   List  — bounded, chronological
- *  - `{prefix}:lock:{id}`            String — advisory instance lock
+ *  - `{prefix}:instance:{id}`  Hash   — instance fields
+ *  - `{prefix}:steps:{id}`     Hash   — stepKey -> JSON(StepState)
+ *  - `{prefix}:logs:{id}`      List   — bounded, chronological
+ *  - `{prefix}:lock:{id}`      String — advisory instance lock
  *
  * Durability depends entirely on how the underlying Redis is configured. See
  * the README's "Redis persistence" section before using this for
@@ -32,6 +32,18 @@ const DEFAULT_MAX_LOGS = 1000
 // already existed (so the caller reads the stored state instead).
 const INIT_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+redis.call('HSET', KEYS[1], unpack(ARGV))
+return 1
+`
+
+// Update-if-present. Returns 1 when the instance existed and was patched, 0 if
+// it was absent — so a stray update (e.g. cancelling a job before its first
+// tick) cannot conjure a half-populated "zombie" instance. This mirrors the
+// in-memory store, which no-ops on a missing record.
+const UPDATE_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
   return 0
 end
 redis.call('HSET', KEYS[1], unpack(ARGV))
@@ -72,6 +84,7 @@ export class RedisStateStore implements StateStore {
 
     // Register the Lua helpers as cached, named commands.
     this.redis.defineCommand("durableInit", { numberOfKeys: 1, lua: INIT_SCRIPT })
+    this.redis.defineCommand("durableUpdate", { numberOfKeys: 1, lua: UPDATE_SCRIPT })
     this.redis.defineCommand("durableLockAcquire", { numberOfKeys: 1, lua: LOCK_ACQUIRE_SCRIPT })
     this.redis.defineCommand("durableLockRenew", { numberOfKeys: 1, lua: LOCK_RENEW_SCRIPT })
     this.redis.defineCommand("durableLockRelease", { numberOfKeys: 1, lua: LOCK_RELEASE_SCRIPT })
@@ -116,9 +129,13 @@ export class RedisStateStore implements StateStore {
     patch: Partial<InstanceState>,
   ): Promise<InstanceState | null> {
     const fields = encodeInstanceFields({ ...patch, updatedAt: patch.updatedAt ?? Date.now() })
-    if (fields.length > 0) {
-      await this.redis.hset(this.instanceKey(instanceId), ...fields)
-    }
+    if (fields.length === 0) return this.getInstance(instanceId)
+
+    const updated = (await this.cmd("durableUpdate")(
+      this.instanceKey(instanceId),
+      ...fields,
+    )) as number
+    if (updated === 0) return null
     return this.getInstance(instanceId)
   }
 
@@ -167,7 +184,11 @@ export class RedisStateStore implements StateStore {
 
   async getSteps(instanceId: string): Promise<StepState[]> {
     const hash = await this.redis.hgetall(this.stepsKey(instanceId))
-    return Object.values(hash).map((raw) => JSON.parse(raw) as StepState)
+    // HGETALL has no ordering guarantee, so sort by start time to give a stable,
+    // chronological result that matches the in-memory store.
+    return Object.values(hash)
+      .map((raw) => JSON.parse(raw) as StepState)
+      .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
   }
 
   async saveStep(instanceId: string, stepKey: string, state: StepState): Promise<void> {
@@ -187,6 +208,9 @@ export class RedisStateStore implements StateStore {
     log: DurableLog,
     maxLogs: number = DEFAULT_MAX_LOGS,
   ): Promise<void> {
+    // `maxLogs <= 0` disables log retention. Guard it explicitly: `ltrim(-0, -1)`
+    // is `ltrim(0, -1)`, which keeps the whole list instead of emptying it.
+    if (maxLogs <= 0) return
     const key = this.logsKey(instanceId)
     await this.redis.multi().rpush(key, JSON.stringify(log)).ltrim(key, -maxLogs, -1).exec()
   }
@@ -255,11 +279,17 @@ export class RedisStateStore implements StateStore {
     return lockKey(this.prefix, id)
   }
 
-  /** Resolve a custom (Lua) command defined via `defineCommand`. */
+  /**
+   * Resolve a custom (Lua) command defined via `defineCommand`, bound to the
+   * client. The binding is essential: ioredis dispatches custom commands as
+   * methods on the client, so calling a detached reference would lose `this`.
+   */
   private cmd(name: string): (...args: Array<string | number>) => Promise<unknown> {
-    return (
-      this.redis as unknown as Record<string, (...a: Array<string | number>) => Promise<unknown>>
-    )[name]!
+    const client = this.redis as unknown as Record<
+      string,
+      (...a: Array<string | number>) => Promise<unknown>
+    >
+    return client[name]!.bind(this.redis)
   }
 }
 
@@ -299,8 +329,13 @@ function encodeInstanceFields(patch: Partial<InstanceState>): string[] {
   num("updatedAt", patch.updatedAt)
   num("completedAt", patch.completedAt)
   num("failedAt", patch.failedAt)
-  if ("input" in patch) out.push("input", JSON.stringify(patch.input ?? null))
-  if ("output" in patch) out.push("output", JSON.stringify(patch.output ?? null))
+  // Only persist input/output when actually present. Coercing `undefined` to
+  // `null` would make `getDurableState().output` differ from the in-memory store
+  // (which preserves `undefined`) for a void job.
+  if ("input" in patch && patch.input !== undefined) out.push("input", JSON.stringify(patch.input))
+  if ("output" in patch && patch.output !== undefined) {
+    out.push("output", JSON.stringify(patch.output))
+  }
   if (patch.error !== undefined) out.push("error", JSON.stringify(patch.error))
 
   return out

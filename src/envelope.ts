@@ -37,11 +37,17 @@ export function wrapResumeData(
 
 /** Detect whether some BullMQ `job.data` is a resume envelope. */
 export function isResumeEnvelope(data: unknown): data is ResumeEnvelope {
+  if (typeof data !== "object" || data === null) return false
+  if (!(DURABLE_META_KEY in data) || !("payload" in data)) return false
+  // Validate the metadata shape too, so a user payload that merely happens to
+  // have `__durable__` / `payload` keys is not mistaken for a resume envelope.
+  const meta = (data as Record<string, unknown>)[DURABLE_META_KEY]
   return (
-    typeof data === "object" &&
-    data !== null &&
-    DURABLE_META_KEY in data &&
-    "payload" in (data as Record<string, unknown>)
+    typeof meta === "object" &&
+    meta !== null &&
+    typeof (meta as DurableMeta).instanceId === "string" &&
+    typeof (meta as DurableMeta).originalJobId === "string" &&
+    typeof (meta as DurableMeta).resumeSeq === "number"
   )
 }
 

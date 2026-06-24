@@ -21,6 +21,10 @@ const UNIT_TO_MS: Record<string, number> = {
 // e.g. "10s", "1.5h", "500ms", or a bare number string interpreted as ms.
 const DURATION_PATTERN = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)?$/i
 
+// Same, but the unit is mandatory — used to tell "10s" (a delay) apart from a
+// bare number like "30" (which callers usually mean as text, not milliseconds).
+const UNIT_REQUIRED_PATTERN = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)$/i
+
 /**
  * Parse a {@link DurationInput} into a non-negative integer number of
  * milliseconds.
@@ -48,7 +52,11 @@ export function parseDuration(input: DurationInput): number {
   const value = Number.parseFloat(match[1]!)
   const unit = (match[2] ?? "ms").toLowerCase()
   const unitMs = UNIT_TO_MS[unit]!
-  return Math.round(value * unitMs)
+  const ms = Math.round(value * unitMs)
+  if (!Number.isFinite(ms)) {
+    throw new TypeError(`Invalid duration string: "${input}". Value is too large.`)
+  }
+  return ms
 }
 
 /**
@@ -64,4 +72,13 @@ export function isDurationLike(input: unknown): input is DurationInput {
     return DURATION_PATTERN.test(input.trim())
   }
   return false
+}
+
+/**
+ * Whether a value is a duration string that carries an explicit unit (e.g.
+ * `"10s"`, not `"30"`). Used to safely disambiguate `ctx.retryLater("10s")`
+ * (a delay) from `ctx.retryLater("30")` (a reason that merely looks numeric).
+ */
+export function hasExplicitDurationUnit(input: unknown): boolean {
+  return typeof input === "string" && UNIT_REQUIRED_PATTERN.test(input.trim())
 }

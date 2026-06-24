@@ -17,10 +17,10 @@ import {
 import type { ScheduleResumeInput } from "./scheduler"
 import type { StateStore } from "./store/state-store"
 import type { DurableContext, DurableLog, StepFn, StepOptions } from "./types"
-import { type DurationInput, isDurationLike, parseDuration } from "./utils/duration"
+import { type DurationInput, hasExplicitDurationUnit, parseDuration } from "./utils/duration"
 import { stepIdOf } from "./utils/keys"
 import { computeBackoff, resolveRetry } from "./utils/retry"
-import { serializeError } from "./utils/serialize"
+import { cloneValue, serializeError } from "./utils/serialize"
 
 /** Minimal surface used to mirror durable logs onto the BullMQ job. */
 export interface JobLogSink {
@@ -95,16 +95,21 @@ export class DurableContextImpl implements DurableContext {
 
     try {
       const result = await fn()
+      // Persist and return the *cloned* result so the first run observes exactly
+      // what a later replay would: a store round-trip is a JSON round-trip, which
+      // turns Dates into strings, drops `undefined`, etc. Returning the live value
+      // here would let code work on the first tick and crash on resume.
+      const checkpointed = cloneValue(result)
       await this.deps.store.saveStep(this.instanceId, key, {
         key,
         type: "step",
         status: "completed",
-        result,
+        result: checkpointed,
         attempts,
         startedAt,
         completedAt: Date.now(),
       })
-      return result
+      return checkpointed
     } catch (error) {
       return await this.handleStepError<T>(key, error, options, attempts, startedAt)
     }
@@ -135,7 +140,16 @@ export class DurableContextImpl implements DurableContext {
     const retry = resolveRetry(options.retry, this.deps.defaultStepOptions?.retry)
     const isRetryLater = error instanceof RetryLaterError
 
-    if (attempts < retry.attempts) {
+    // `retryLater` is an expected "still pending" signal, not a failure. By
+    // default it keeps polling until the step stops throwing it; an explicit
+    // `attempts` (step- or worker-level) caps the number of polls. A genuine
+    // error is always bounded by the resolved `attempts` (default 1 = no retry).
+    const attemptsConfigured =
+      options.retry?.attempts ?? this.deps.defaultStepOptions?.retry?.attempts
+    const maxAttempts =
+      isRetryLater && attemptsConfigured === undefined ? Number.POSITIVE_INFINITY : retry.attempts
+
+    if (attempts < maxAttempts) {
       const delayMs =
         isRetryLater && error.delayMs !== undefined
           ? error.delayMs
@@ -233,8 +247,10 @@ export class DurableContextImpl implements DurableContext {
     if (reasonOrDelay === undefined) {
       return new RetryLaterError()
     }
-    // Single argument: treat duration-like values as a delay, otherwise a reason.
-    if (isDurationLike(reasonOrDelay)) {
+    // Single argument: a number, or a unit-qualified string like "10s", is a
+    // delay. Any other string — including a bare number like "30" — is a reason,
+    // so a numeric-looking reason is never silently turned into a delay.
+    if (typeof reasonOrDelay === "number" || hasExplicitDurationUnit(reasonOrDelay)) {
       return new RetryLaterError(parseDuration(reasonOrDelay))
     }
     return new RetryLaterError(undefined, String(reasonOrDelay))

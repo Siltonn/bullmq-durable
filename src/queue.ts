@@ -28,6 +28,9 @@ import type {
 import { createInstanceId, DEFAULT_DURABLE_PREFIX, resumeJobId } from "./utils/keys"
 import { wrapResumeData } from "./envelope"
 
+/** BullMQ attempts for resume ticks when the caller does not override it. */
+const DEFAULT_RESUME_ATTEMPTS = 3
+
 export class DurableQueue<TJobs extends DurableJobMap = DurableJobMap> implements ResumeScheduler {
   private queue?: Queue
   private store?: StateStore
@@ -99,7 +102,7 @@ export class DurableQueue<TJobs extends DurableJobMap = DurableJobMap> implement
       {
         delay: input.delayMs,
         jobId: resumeJobId(input.originalJobId, input.resumeSeq),
-        attempts: 1,
+        attempts: this.options.resumeAttempts ?? DEFAULT_RESUME_ATTEMPTS,
         removeOnComplete: true,
       },
     )

@@ -17,8 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Durable context API: `ctx.step` (run-once, checkpointed), `ctx.sleep` /
   `ctx.sleepUntil` (yield without holding a worker), `ctx.retryLater`,
   `ctx.nonRetryable`, `ctx.log`, and `ctx.stepId`.
-- Per-step retry policy with `fixed` / `exponential` backoff, optional `maxDelay`,
-  and worker-level `defaultStepOptions`.
+- Per-step retry policy with `fixed` / `exponential` backoff, optional `maxDelay`
+  (exponential backoff is capped at a 1-hour ceiling by default), and
+  worker-level `defaultStepOptions`. `retryLater` polls until the step stops
+  throwing it, unless an explicit `attempts` caps it.
+- Configurable `resumeAttempts` (default `3`) so a transient failure to enqueue a
+  resume tick self-heals via BullMQ retry instead of stranding the instance.
+- Step results are checkpointed via JSON, and the first run returns the same
+  serialised shape a replay would — so code can't work once and break on resume.
 - `RedisStateStore` (default) and `MemoryStateStore`, plus a pluggable
   `StateStore` interface for custom backends.
 - Per-instance advisory locking with heartbeat renewal, retention TTLs,

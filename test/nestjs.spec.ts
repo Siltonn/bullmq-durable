@@ -51,6 +51,22 @@ class GenerationService {
   constructor(@InjectDurableQueue("generation") readonly queue: DurableQueue) {}
 }
 
+// A processor that inherits a @DurableProcess method from a base class.
+@DurableProcessor("media")
+class BaseMediaProcessor {
+  @DurableProcess("transcode")
+  async transcode(): Promise<string> {
+    return "transcode"
+  }
+}
+
+class MediaProcessor extends BaseMediaProcessor {
+  @DurableProcess("thumbnail")
+  async thumbnail(): Promise<string> {
+    return "thumbnail"
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 describe("nestjs decorators & tokens", () => {
@@ -122,6 +138,32 @@ describe("DurableExplorer", () => {
     expect(instance.calls).toContain("video")
 
     await explorer.onModuleDestroy()
+  })
+
+  it("discovers @DurableProcess methods inherited from a base class", () => {
+    const instance = new MediaProcessor()
+    const created: Array<Record<string, unknown>> = []
+    const factory: DurableWorkerFactory = (_queueName, processor) => {
+      created.push(processor as Record<string, unknown>)
+      return { close: async () => undefined }
+    }
+    const discovery = { getProviders: () => [{ instance }] }
+    const moduleRef = {
+      get: (token: unknown) =>
+        token === DURABLE_BULL_OPTIONS ? { connection: CONNECTION } : undefined,
+    }
+
+    const explorer = new DurableExplorer(
+      discovery as never,
+      new Reflector(),
+      moduleRef as never,
+      factory,
+    )
+    explorer.onModuleInit()
+
+    expect(created).toHaveLength(1)
+    // Both the inherited `transcode` and the subclass's own `thumbnail`.
+    expect(Object.keys(created[0]!).sort()).toEqual(["thumbnail", "transcode"])
   })
 
   it("ignores providers without @DurableProcessor", async () => {

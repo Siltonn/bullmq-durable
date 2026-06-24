@@ -123,7 +123,10 @@ export class MemoryStateStore implements StateStore {
   async getSteps(instanceId: string): Promise<StepState[]> {
     const record = this.live(instanceId)
     if (!record) return []
-    return [...record.steps.values()].map((step) => cloneValue(step))
+    // Sort by start time for a stable, chronological order that matches Redis.
+    return [...record.steps.values()]
+      .map((step) => cloneValue(step))
+      .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
   }
 
   async saveStep(instanceId: string, stepKey: string, state: StepState): Promise<void> {
@@ -147,6 +150,7 @@ export class MemoryStateStore implements StateStore {
     log: DurableLog,
     maxLogs: number = DEFAULT_MAX_LOGS,
   ): Promise<void> {
+    if (maxLogs <= 0) return // log retention disabled
     const record = this.live(instanceId)
     if (!record) return
     record.logs.push(cloneValue(log))

@@ -9,6 +9,7 @@
 import { Redis } from "ioredis"
 import { afterAll, describe, expect, it } from "vitest"
 import type { DurableContext, DurableJob } from "../src/index"
+import { DurableQueue } from "../src/index"
 import { RedisStateStore } from "../src/store/redis-store"
 import type { StepState } from "../src/types"
 import { TestEngine } from "./helpers/engine"
@@ -97,6 +98,36 @@ describeRedis("RedisStateStore (integration)", () => {
     expect((await store.getInstance(id))?.status).toBe("cancelled")
   })
 
+  it("does not conjure a 'zombie' instance when updating a missing one", async () => {
+    const id = newId()
+    // Updating/cancelling before the instance exists must be a no-op (matching
+    // the in-memory store), not an HSET that creates a half-populated hash.
+    expect(await store.updateInstance(id, { status: "running" })).toBeNull()
+    await store.cancelInstance(id)
+    expect(await store.getInstance(id)).toBeNull()
+
+    // A subsequent real init then creates a clean, complete instance.
+    const created = await init(id)
+    expect(created.status).toBe("running")
+    expect(created.input).toEqual({ hello: "world" })
+  })
+
+  it("preserves undefined output for a void completion", async () => {
+    const id = newId()
+    await init(id)
+    await store.completeInstance(id, undefined)
+    const instance = await store.getInstance(id)
+    expect(instance?.status).toBe("completed")
+    expect(instance?.output).toBeUndefined()
+  })
+
+  it("keeps no logs when maxLogs is 0", async () => {
+    const id = newId()
+    await init(id)
+    await store.appendLog(id, { message: "x", timestamp: 1 }, 0)
+    expect(await store.getLogs(id)).toEqual([])
+  })
+
   it("stores and updates steps", async () => {
     const id = newId()
     await init(id)
@@ -145,12 +176,38 @@ describeRedis("RedisStateStore (integration)", () => {
     expect(ttl).toBeGreaterThan(0)
   })
 
+  it("schedules resume jobs with attempts > 1 so a failed resume tick self-heals", async () => {
+    const queue = new DurableQueue("rq-resume", {
+      connection: { host: REDIS_HOST, port: REDIS_PORT },
+    })
+    try {
+      await queue.scheduleResume({
+        instanceId: "rq-resume:1",
+        queueName: "rq-resume",
+        jobName: "job",
+        jobData: { a: 1 },
+        originalJobId: "1",
+        resumeSeq: 1,
+        delayMs: 60_000,
+        reason: "test",
+      })
+      const delayed = await queue.bull.getDelayed()
+      const job = delayed.find((j) => j.id === "1:resume:1")
+      expect(job?.opts.attempts).toBe(3) // default DEFAULT_RESUME_ATTEMPTS
+    } finally {
+      await queue.bull.obliterate({ force: true })
+      await queue.close()
+    }
+  })
+
   it("drives a full durable flow (step + sleep + retry) end to end", async () => {
+    // `polls` lives across ticks: each resume re-enters the processor and the
+    // poll step is retried until the condition holds.
+    let polls = 0
     const engine = new TestEngine(
       async (_job: DurableJob, ctx: DurableContext) => {
         await ctx.step("create", async () => ({ taskId: "t1" }))
         await ctx.sleep("wait", "10s")
-        let polls = 0
         const result = await ctx.step("poll", { retry: { attempts: 5, delay: "1s" } }, async () => {
           polls++
           if (polls < 2) throw ctx.retryLater("pending")

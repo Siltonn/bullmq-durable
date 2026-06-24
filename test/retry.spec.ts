@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { DurableContext, DurableJob } from "../src/index"
-import { computeBackoff, resolveRetry } from "../src/utils/retry"
+import { computeBackoff, DEFAULT_MAX_BACKOFF_MS, resolveRetry } from "../src/utils/retry"
 import { TestEngine } from "./helpers/engine"
 
 describe("retry policy", () => {
@@ -41,6 +41,14 @@ describe("retry policy", () => {
       maxDelay: "3s",
     })
     expect(computeBackoff(capped, 3)).toBe(3_000) // 4s capped to 3s
+  })
+
+  it("caps exponential backoff at a default ceiling when no maxDelay is set", () => {
+    const exp = resolveRetry({ attempts: 100, delay: "1s", backoff: "exponential" })
+    // Without a cap, 1s * 2**79 would overflow toward Infinity.
+    const delay = computeBackoff(exp, 80)
+    expect(Number.isFinite(delay)).toBe(true)
+    expect(delay).toBe(DEFAULT_MAX_BACKOFF_MS)
   })
 })
 
@@ -128,6 +136,61 @@ describe("ctx.retryLater", () => {
     expect(ticks).toBe(2)
     expect(outcome.type).toBe("completed")
     expect(instance?.output).toEqual({ status: "done" })
+  })
+
+  it("polls indefinitely by default (no retry config) until it stops throwing", async () => {
+    let polls = 0
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      return ctx.step("poll", async () => {
+        polls++
+        if (polls < 4) throw ctx.retryLater("pending")
+        return "ready"
+      })
+    })
+
+    // With no explicit `attempts`, retryLater must not exhaust on the first call.
+    const { outcome, ticks } = await engine.run("job", {}, "1")
+    expect(polls).toBe(4)
+    expect(ticks).toBe(3)
+    expect(outcome).toEqual({ type: "completed", output: "ready" })
+  })
+
+  it("caps polling when attempts is explicitly configured", async () => {
+    let polls = 0
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      await ctx.step("poll", { retry: { attempts: 3, delay: "1s" } }, async () => {
+        polls++
+        throw ctx.retryLater("never ready")
+      })
+      return "done"
+    })
+
+    const { outcome } = await engine.run("job", {}, "1")
+    expect(polls).toBe(3) // bounded by the explicit attempts
+    expect(outcome.type).toBe("failed")
+  })
+
+  it("treats a numeric-looking single argument as a reason, not a delay", async () => {
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      await ctx.step("poll", { retry: { attempts: 5, delay: "9s" } }, async () => {
+        throw ctx.retryLater("30") // "30" is a reason; the delay comes from retry config
+      })
+      return "done"
+    })
+    await engine.start("job", {}, "1")
+    expect(engine.peekPending()[0]?.delayMs).toBe(9_000)
+    expect(engine.peekPending()[0]?.reason).toContain("30")
+  })
+
+  it("treats a unit-qualified single argument as a delay", async () => {
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      await ctx.step("poll", { retry: { attempts: 5, delay: "9s" } }, async () => {
+        throw ctx.retryLater("10s")
+      })
+      return "done"
+    })
+    await engine.start("job", {}, "1")
+    expect(engine.peekPending()[0]?.delayMs).toBe(10_000)
   })
 
   it("honours an explicit retryLater delay", async () => {

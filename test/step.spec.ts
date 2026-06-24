@@ -90,6 +90,29 @@ describe("ctx.step", () => {
     expect(outcome.type).toBe("completed")
   })
 
+  it("returns the checkpointed (serialized) shape on the first run, matching replay", async () => {
+    let firstRunValue: { when: unknown; tag?: unknown } | undefined
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      firstRunValue = await ctx.step("with-date", async () => ({
+        when: new Date(0),
+        tag: undefined,
+      }))
+      return "done"
+    })
+
+    await engine.run("job", {}, "1")
+
+    // The value handed back on the first tick is already the post-round-trip
+    // shape a replay would yield: the Date is an ISO string and the `undefined`
+    // field is gone. Returning the live object here would let code work the
+    // first time and throw (e.g. `.getTime()` on a string) after a resume.
+    expect(typeof firstRunValue?.when).toBe("string")
+    expect(firstRunValue && "tag" in firstRunValue).toBe(false)
+
+    const step = await engine.store.getStep(engine.instanceId("1"), "with-date")
+    expect(step?.result).toEqual(firstRunValue)
+  })
+
   it("exposes a deterministic stepId for idempotency keys", async () => {
     let stepId = ""
     const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {

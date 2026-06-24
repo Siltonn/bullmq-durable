@@ -236,6 +236,13 @@ export interface DurableQueueOptions {
   bullPrefix?: string
   /** Default BullMQ job options applied to every `add`. */
   defaultJobOptions?: JobsOptions
+  /**
+   * BullMQ `attempts` for the internally-scheduled resume jobs (sleep / retry /
+   * `retryLater` ticks). A value `> 1` lets BullMQ retry a resume tick whose
+   * *next* resume failed to enqueue, instead of stranding the instance in
+   * `yielded`. Replays are idempotent, so this is always safe. Defaults to `3`.
+   */
+  resumeAttempts?: number
 }
 
 /** Options for {@link DurableWorker}. */
@@ -257,6 +264,11 @@ export interface DurableWorkerOptions {
   defaultStepOptions?: StepOptions
   /** Maximum number of log entries kept per instance. Defaults to `1000`. */
   maxLogs?: number
+  /**
+   * BullMQ `attempts` for internally-scheduled resume jobs. See
+   * {@link DurableQueueOptions.resumeAttempts}. Defaults to `3`.
+   */
+  resumeAttempts?: number
   /** Escape hatch: extra BullMQ worker options merged verbatim. */
   bullWorkerOptions?: Partial<WorkerOptions>
 }

@@ -133,6 +133,12 @@ const task = await ctx.step("create-video-task", async () => {
 - Otherwise `fn` runs; on success the result is checkpointed.
 - On failure the step retries (per its [retry policy](#7-retry-policy)) or fails the instance.
 
+**Step results must be JSON-serialisable.** A result is checkpointed by
+round-tripping through JSON, so the value you get back — even on the first run —
+is the JSON form: `Date` becomes a string, `Map`/`Set` become `{}`, and
+`undefined` fields disappear. Returning the same shape on the first run and on
+replay is deliberate, so code never works once and then breaks after a resume.
+
 **Keys must be stable across replays.** Use a constant, never a timestamp or
 random value:
 
@@ -194,6 +200,11 @@ const result = await ctx.step(
 - `ctx.nonRetryable("reason")` — fails the instance immediately, skipping any
   remaining attempts.
 
+Unlike a thrown error, `retryLater` is an expected "still pending" signal: by
+default it keeps polling **until the step stops throwing it**. Set
+`retry.attempts` on the step (or via `defaultStepOptions`) to cap the number of
+polls — once they are spent, the instance fails.
+
 ## 7. Retry policy
 
 Each step has an independent retry policy (this is **step-level** retry, distinct
@@ -213,7 +224,8 @@ await ctx.step("generate", {
 Backoff before the *n*-th retry:
 
 - `fixed` → `delay`
-- `exponential` → `delay * 2^(n-1)`, capped at `maxDelay`
+- `exponential` → `delay * 2^(n-1)`, capped at `maxDelay` (which defaults to a
+  1-hour ceiling, so the delay can never run away to `Infinity`)
 
 Set worker-wide defaults via `defaultStepOptions`; a step's own options win:
 
@@ -395,8 +407,12 @@ and `.bull` (the underlying BullMQ queue).
 
 `processor` is either a single `(job, ctx) => result` function or a
 `{ [jobName]: handler }` map. Options add `concurrency`, `lockTimeout`,
-`retention`, `defaultStepOptions`, `maxLogs`, `stateStore`, `durablePrefix`, and
-`bullWorkerOptions` on top of `connection`.
+`retention`, `defaultStepOptions`, `maxLogs`, `resumeAttempts`, `stateStore`,
+`durablePrefix`, and `bullWorkerOptions` on top of `connection`.
+
+`resumeAttempts` (default `3`) is the BullMQ `attempts` given to internally
+scheduled resume ticks, so a transient failure to enqueue the next resume is
+retried rather than stranding the instance.
 
 ### `ctx`
 

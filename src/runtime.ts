@@ -179,7 +179,10 @@ export class DurableRuntime {
    */
   private startLockRenewal(): () => void {
     const { store, instanceId, lockTimeoutMs } = this.params
-    const interval = Math.max(1_000, Math.floor(lockTimeoutMs / 3))
+    // Renew at roughly a third of the TTL so the lock is refreshed ~3x before it
+    // would expire. The floor is small (not 1s) so short lock timeouts are still
+    // renewed *before* they lapse rather than after.
+    const interval = Math.max(50, Math.floor(lockTimeoutMs / 3))
     const timer = setInterval(() => {
       void store.renewLock(instanceId, this.lockToken, lockTimeoutMs).catch(() => {
         // Best effort: a lost lock surfaces as a conflicting write elsewhere.

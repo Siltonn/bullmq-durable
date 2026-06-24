@@ -25,4 +25,14 @@ describe("resume envelope", () => {
     const envelope = wrapResumeData("just-a-string", "gen:1", "1", 1)
     expect(unwrapResumeData(envelope).payload).toBe("just-a-string")
   })
+
+  it("does not misdetect a user payload that merely has the reserved keys", () => {
+    // Same key names, but the metadata is not a real DurableMeta.
+    expect(isResumeEnvelope({ __durable__: 1, payload: 2 })).toBe(false)
+    expect(isResumeEnvelope({ __durable__: { instanceId: "i" }, payload: 2 })).toBe(false)
+
+    // Such a payload round-trips untouched (the processor sees its own data).
+    const userData = { __durable__: "marketing-flag", payload: { id: 7 } }
+    expect(unwrapResumeData(userData).payload).toEqual(userData)
+  })
 })

@@ -19,19 +19,25 @@ export function createInstanceId(queueName: string, jobId: string | number): str
   return `${queueName}:${jobId}`
 }
 
+// The kind of state is encoded as a fixed segment *before* the instance id, so
+// the instance id is always the trailing part of the key. This guarantees the
+// instance hash of one instance can never collide with the steps/logs key of
+// another (which the old `…:instance:{id}:steps` suffix layout allowed when an
+// instance id ended in `:steps`).
+
 /** `{prefix}:instance:{instanceId}` — the instance hash. */
 export function instanceKey(prefix: string, instanceId: string): string {
   return `${prefix}:instance:${instanceId}`
 }
 
-/** `{prefix}:instance:{instanceId}:steps` — the per-step hash. */
+/** `{prefix}:steps:{instanceId}` — the per-step hash. */
 export function stepsKey(prefix: string, instanceId: string): string {
-  return `${prefix}:instance:${instanceId}:steps`
+  return `${prefix}:steps:${instanceId}`
 }
 
-/** `{prefix}:instance:{instanceId}:logs` — the bounded log list. */
+/** `{prefix}:logs:{instanceId}` — the bounded log list. */
 export function logsKey(prefix: string, instanceId: string): string {
-  return `${prefix}:instance:${instanceId}:logs`
+  return `${prefix}:logs:${instanceId}`
 }
 
 /** `{prefix}:lock:{instanceId}` — the instance advisory lock. */

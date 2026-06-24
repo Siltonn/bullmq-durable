@@ -71,6 +71,46 @@ describe("MemoryStateStore", () => {
     expect(await store.nextResumeSeq(INSTANCE)).toBe(3)
   })
 
+  it("does not conjure an instance when updating or cancelling a missing one", async () => {
+    expect(await store.updateInstance("missing", { status: "running" })).toBeNull()
+    await store.cancelInstance("missing")
+    await store.completeInstance("missing", { ok: true })
+    expect(await store.getInstance("missing")).toBeNull()
+  })
+
+  it("preserves undefined output for a void completion", async () => {
+    await init(store)
+    await store.completeInstance(INSTANCE, undefined)
+    const instance = await store.getInstance(INSTANCE)
+    expect(instance?.status).toBe("completed")
+    expect(instance?.output).toBeUndefined()
+  })
+
+  it("returns steps ordered by startedAt", async () => {
+    await init(store)
+    await store.saveStep(INSTANCE, "second", {
+      key: "second",
+      type: "step",
+      status: "completed",
+      attempts: 1,
+      startedAt: 200,
+    })
+    await store.saveStep(INSTANCE, "first", {
+      key: "first",
+      type: "step",
+      status: "completed",
+      attempts: 1,
+      startedAt: 100,
+    })
+    expect((await store.getSteps(INSTANCE)).map((s) => s.key)).toEqual(["first", "second"])
+  })
+
+  it("keeps no logs when maxLogs is 0", async () => {
+    await init(store)
+    await store.appendLog(INSTANCE, { message: "x", timestamp: 1 }, 0)
+    expect(await store.getLogs(INSTANCE)).toEqual([])
+  })
+
   it("stores and updates steps", async () => {
     await init(store)
     const step: StepState = { key: "a", type: "step", status: "running", attempts: 1 }
