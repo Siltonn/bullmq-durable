@@ -1,0 +1,27 @@
+{
+  "name": "bullmq-durable-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "author": "elmer",
+  "description": "Durable execution for BullMQ + a modern dashboard and durable instance inspector.",
+  "packageManager": "pnpm@11.3.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "format": "prettier --write \"packages/*/{src,test,examples,client}/**/*.{ts,tsx}\"",
+    "format:check": "prettier --check \"packages/*/{src,test,examples,client}/**/*.{ts,tsx}\"",
+    "dev:cockpit": "pnpm --filter bullmq-cockpit dev",
+    "build:durable": "pnpm --filter bullmq-durable build",
+    "build:cockpit": "pnpm --filter bullmq-cockpit build"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3"
+  }
+}
