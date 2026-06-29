@@ -61,3 +61,39 @@ export function stepIdOf(instanceId: string, stepKey: string): string {
 export function resumeJobId(originalJobId: string, resumeSeq: number): string {
   return `${originalJobId}:resume:${resumeSeq}`
 }
+
+// ---------------------------------------------------------------------------
+// Status index — the bundled RedisStateStore's on-disk optimization
+// ---------------------------------------------------------------------------
+//
+// To let a read-only observer (the bullmq-studio dashboard) answer "how many
+// instances are in each status?" and "which instances are in flight?" WITHOUT a
+// full keyspace `SCAN`, the RedisStateStore maintains a small secondary index,
+// kept in lock-step with every status transition (see redis-store.ts).
+//
+// It is **purely additive**: it never alters the instance/steps/logs/lock layout
+// above, and it is **not** part of the StateStore contract — a custom store
+// simply won't have it, and a reader falls back. Treat it as an optimization,
+// never as the source of truth for an individual instance.
+
+/** ZSET score meaning "this terminal instance has no retention TTL, so it never
+ *  expires and must never be pruned." Chosen far beyond any realistic epoch-ms
+ *  (≈ year 2286) so `ZREMRANGEBYSCORE … -inf <now>` always skips it. */
+export const INDEX_NEVER_EXPIRES = 9_999_999_999_999
+
+/** The terminal statuses that each get their own index bucket. */
+export type TerminalStatus = "completed" | "failed" | "cancelled"
+
+/** `{prefix}:idx:active` — SET of non-terminal (running/yielded) instance ids.
+ *  Bounded by in-flight work, so hydrating it in full stays cheap. */
+export function activeIndexKey(prefix: string): string {
+  return `${prefix}:idx:active`
+}
+
+/** `{prefix}:idx:done:{status}` — ZSET of terminal instance ids, scored by the
+ *  epoch-ms at which the instance should expire ({@link INDEX_NEVER_EXPIRES}
+ *  when un-retained). The score lets a reader prune retention-expired ids with a
+ *  single `ZREMRANGEBYSCORE … -inf <now>` so `ZCARD` stays exact. */
+export function terminalIndexKey(prefix: string, status: TerminalStatus): string {
+  return `${prefix}:idx:done:${status}`
+}

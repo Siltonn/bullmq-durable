@@ -217,12 +217,32 @@ export type DurableProcessorInput<TJobs extends DurableJobMap> =
 // Options
 // ---------------------------------------------------------------------------
 
-/** How long to retain finished instances before they expire from the store. */
+/**
+ * How long to retain a finished instance's state before it expires from the
+ * store. A durable instance outlives its BullMQ jobs (the original job completes
+ * on the first yield and resume ticks are removed immediately), so its state is
+ * the persistent record and is bounded here, independently of the queue's job
+ * retention. Every field has a safe default ({@link DEFAULT_RETENTION}) so the
+ * store never accumulates finished instances forever without configuration.
+ */
 export interface RetentionOptions {
-  /** TTL applied once an instance completes. */
+  /** TTL applied once an instance completes. @defaultValue `"24h"` */
   completed?: DurationInput
-  /** TTL applied once an instance fails. */
+  /** TTL applied once an instance fails. @defaultValue `"7d"` */
   failed?: DurationInput
+  /** TTL applied once an instance is cancelled. @defaultValue `"24h"` */
+  cancelled?: DurationInput
+}
+
+/**
+ * Default retention applied when {@link RetentionOptions} (or a specific field)
+ * is not configured. Chosen to keep finished instances visible to the dashboard
+ * for a sensible window without growing the store unbounded.
+ */
+export const DEFAULT_RETENTION: Required<RetentionOptions> = {
+  completed: "24h",
+  failed: "7d",
+  cancelled: "24h",
 }
 
 /** Options for {@link DurableQueue}. */

@@ -15,7 +15,17 @@
 import type { ConnectionOptions } from "bullmq"
 import { Redis, type RedisOptions } from "ioredis"
 import type { DurableLog, InstanceState, InstanceStatus, StepState } from "../types"
-import { DEFAULT_DURABLE_PREFIX, instanceKey, lockKey, logsKey, stepsKey } from "../utils/keys"
+import {
+  activeIndexKey,
+  DEFAULT_DURABLE_PREFIX,
+  INDEX_NEVER_EXPIRES,
+  instanceKey,
+  lockKey,
+  logsKey,
+  stepsKey,
+  terminalIndexKey,
+  type TerminalStatus,
+} from "../utils/keys"
 import { cloneValue, serializeError } from "../utils/serialize"
 import type { InitInstanceInput, StateStore } from "./state-store"
 
@@ -30,11 +40,17 @@ const DEFAULT_MAX_LOGS = 1000
 
 // Atomic create-if-absent. Returns 1 when the instance was created, 0 if it
 // already existed (so the caller reads the stored state instead).
+//
+// KEYS: [1] instance hash, [2] idx:active set.
+// ARGV: [1] instance id, [2..] HSET field pairs.
+// New instances start `running` (non-terminal), so they join the active set in
+// the same atomic step as the hash write — the index can never drift from state.
 const INIT_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 0
 end
-redis.call('HSET', KEYS[1], unpack(ARGV))
+redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+redis.call('SADD', KEYS[2], ARGV[1])
 return 1
 `
 
@@ -42,11 +58,61 @@ return 1
 // it was absent — so a stray update (e.g. cancelling a job before its first
 // tick) cannot conjure a half-populated "zombie" instance. This mirrors the
 // in-memory store, which no-ops on a missing record.
+//
+// KEYS: [1] instance hash, [2] idx:active, [3] idx:done:completed,
+//       [4] idx:done:failed, [5] idx:done:cancelled.
+// ARGV: [1] instance id, [2] new status ('' when the patch doesn't change it),
+//       [3] terminal score (INDEX_NEVER_EXPIRES — re-scored later by retention),
+//       [4..] HSET field pairs.
+// The index is maintained ONLY on a real status transition, atomically with the
+// patch: terminal statuses leave the active set and enter their done-bucket;
+// running<->yielded stays active (SADD is idempotent, covering the backfill case
+// where an in-flight instance wasn't yet indexed).
 const UPDATE_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 0
 end
-redis.call('HSET', KEYS[1], unpack(ARGV))
+local old = redis.call('HGET', KEYS[1], 'status')
+redis.call('HSET', KEYS[1], unpack(ARGV, 4))
+local new = ARGV[2]
+if new ~= '' and new ~= old then
+  if new == 'completed' then
+    redis.call('SREM', KEYS[2], ARGV[1]); redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
+  elseif new == 'failed' then
+    redis.call('SREM', KEYS[2], ARGV[1]); redis.call('ZADD', KEYS[4], ARGV[3], ARGV[1])
+  elseif new == 'cancelled' then
+    redis.call('SREM', KEYS[2], ARGV[1]); redis.call('ZADD', KEYS[5], ARGV[3], ARGV[1])
+  else
+    redis.call('SADD', KEYS[2], ARGV[1])
+  end
+end
+return 1
+`
+
+// Apply retention: expire the instance's data keys, re-score its terminal index
+// entry to its real expiry epoch (now + ttl), AND prune the bucket of any ids
+// whose expiry has already passed. Doing all three in one script keeps the index
+// in step with the TTL and bounded WITHOUT relying on a reader to prune it — so a
+// library-only deployment (no dashboard) never leaks index entries.
+//
+// KEYS: [1] instance, [2] steps, [3] logs, [4] done:completed, [5] done:failed,
+//       [6] done:cancelled.
+// ARGV: [1] ttlMs, [2] expiry score (now + ttlMs), [3] instance id, [4] now.
+const EXPIRE_SCRIPT = `
+redis.call('PEXPIRE', KEYS[1], ARGV[1])
+redis.call('PEXPIRE', KEYS[2], ARGV[1])
+redis.call('PEXPIRE', KEYS[3], ARGV[1])
+local s = redis.call('HGET', KEYS[1], 'status')
+if s == 'completed' then
+  redis.call('ZADD', KEYS[4], ARGV[2], ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[4])
+elseif s == 'failed' then
+  redis.call('ZADD', KEYS[5], ARGV[2], ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', ARGV[4])
+elseif s == 'cancelled' then
+  redis.call('ZADD', KEYS[6], ARGV[2], ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', ARGV[4])
+end
 return 1
 `
 
@@ -82,9 +148,11 @@ export class RedisStateStore implements StateStore {
     this.prefix = options.prefix ?? DEFAULT_DURABLE_PREFIX
     this.redis = createClient(options.connection)
 
-    // Register the Lua helpers as cached, named commands.
-    this.redis.defineCommand("durableInit", { numberOfKeys: 1, lua: INIT_SCRIPT })
-    this.redis.defineCommand("durableUpdate", { numberOfKeys: 1, lua: UPDATE_SCRIPT })
+    // Register the Lua helpers as cached, named commands. The key counts must
+    // match each script's KEYS arity (see the script comments above).
+    this.redis.defineCommand("durableInit", { numberOfKeys: 2, lua: INIT_SCRIPT })
+    this.redis.defineCommand("durableUpdate", { numberOfKeys: 5, lua: UPDATE_SCRIPT })
+    this.redis.defineCommand("durableExpire", { numberOfKeys: 6, lua: EXPIRE_SCRIPT })
     this.redis.defineCommand("durableLockAcquire", { numberOfKeys: 1, lua: LOCK_ACQUIRE_SCRIPT })
     this.redis.defineCommand("durableLockRenew", { numberOfKeys: 1, lua: LOCK_RENEW_SCRIPT })
     this.redis.defineCommand("durableLockRelease", { numberOfKeys: 1, lua: LOCK_RELEASE_SCRIPT })
@@ -109,6 +177,8 @@ export class RedisStateStore implements StateStore {
 
     const created = (await this.cmd("durableInit")(
       this.instanceKey(input.instanceId),
+      this.activeKey(),
+      input.instanceId,
       ...encodeInstanceFields(instance),
     )) as number
 
@@ -131,8 +201,19 @@ export class RedisStateStore implements StateStore {
     const fields = encodeInstanceFields({ ...patch, updatedAt: patch.updatedAt ?? Date.now() })
     if (fields.length === 0) return this.getInstance(instanceId)
 
+    // Index keys + transition control args precede the HSET field pairs. A patch
+    // that doesn't set `status` passes "" so the Lua skips all index work — the
+    // common non-transition update (runCount / resumeSeq / output) costs nothing
+    // extra.
     const updated = (await this.cmd("durableUpdate")(
       this.instanceKey(instanceId),
+      this.activeKey(),
+      this.terminalKey("completed"),
+      this.terminalKey("failed"),
+      this.terminalKey("cancelled"),
+      instanceId,
+      patch.status ?? "",
+      String(INDEX_NEVER_EXPIRES),
       ...fields,
     )) as number
     if (updated === 0) return null
@@ -247,12 +328,23 @@ export class RedisStateStore implements StateStore {
   // -- Retention -----------------------------------------------------------
 
   async expireInstance(instanceId: string, ttlMs: number): Promise<void> {
-    await this.redis
-      .multi()
-      .pexpire(this.instanceKey(instanceId), ttlMs)
-      .pexpire(this.stepsKey(instanceId), ttlMs)
-      .pexpire(this.logsKey(instanceId), ttlMs)
-      .exec()
+    // Expire the data keys, re-score this instance's terminal index entry to its
+    // real expiry epoch, AND prune the bucket of already-expired ids — so the
+    // index stays bounded and exact without a reader having to prune it (see
+    // EXPIRE_SCRIPT).
+    const now = Date.now()
+    await this.cmd("durableExpire")(
+      this.instanceKey(instanceId),
+      this.stepsKey(instanceId),
+      this.logsKey(instanceId),
+      this.terminalKey("completed"),
+      this.terminalKey("failed"),
+      this.terminalKey("cancelled"),
+      String(ttlMs),
+      String(now + ttlMs),
+      instanceId,
+      String(now),
+    )
   }
 
   // -- Lifecycle -----------------------------------------------------------
@@ -277,6 +369,14 @@ export class RedisStateStore implements StateStore {
 
   private lockKey(id: string): string {
     return lockKey(this.prefix, id)
+  }
+
+  private activeKey(): string {
+    return activeIndexKey(this.prefix)
+  }
+
+  private terminalKey(status: TerminalStatus): string {
+    return terminalIndexKey(this.prefix, status)
   }
 
   /**

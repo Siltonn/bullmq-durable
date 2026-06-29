@@ -14,12 +14,13 @@ import { DurableContextImpl, type JobLogSink } from "./context"
 import { DurableCancelledError, DurableYieldError } from "./errors"
 import type { ResumeScheduler, ScheduleResumeInput } from "./scheduler"
 import type { StateStore } from "./store/state-store"
-import type {
-  DurableContext,
-  DurableJob,
-  DurableProcessor,
-  RetentionOptions,
-  StepOptions,
+import {
+  DEFAULT_RETENTION,
+  type DurableContext,
+  type DurableJob,
+  type DurableProcessor,
+  type RetentionOptions,
+  type StepOptions,
 } from "./types"
 import { parseDuration } from "./utils/duration"
 import { deserializeError } from "./utils/serialize"
@@ -158,6 +159,7 @@ export class DurableRuntime {
       }
       if (error instanceof DurableCancelledError) {
         await store.cancelInstance(instanceId)
+        await this.applyRetention("cancelled")
         return { type: "cancelled" }
       }
       await store.failInstance(instanceId, error)
@@ -166,10 +168,14 @@ export class DurableRuntime {
     }
   }
 
-  /** Apply the configured retention TTL once an instance reaches a terminal state. */
-  private async applyRetention(kind: "completed" | "failed"): Promise<void> {
-    const ttl = this.params.retention?.[kind]
-    if (ttl === undefined) return
+  /**
+   * Bound a finished instance's state with a retention TTL once it reaches a
+   * terminal state. Falls back to {@link DEFAULT_RETENTION} when unconfigured, so
+   * the store never accumulates finished instances forever — applied for every
+   * terminal status (completed / failed / cancelled).
+   */
+  private async applyRetention(kind: keyof RetentionOptions): Promise<void> {
+    const ttl = this.params.retention?.[kind] ?? DEFAULT_RETENTION[kind]
     await this.params.store.expireInstance(this.params.instanceId, parseDuration(ttl))
   }
 

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Status index** for read-only observers (the dashboard): `RedisStateStore`
+  maintains an additive `{prefix}:idx:*` index from the first instance, kept in
+  lock-step with every status transition, so per-status counts and the in-flight
+  set can be read without scanning Redis. It lives inside the bundled Redis store
+  (no `StateStore` interface change), and is bounded by the same retention TTL as
+  the instance state.
+- `RetentionOptions.cancelled` — TTL for cancelled instances (defaults to `"24h"`).
+
+### Changed
+
+- **Finished instances now expire by default.** `retention` falls back to a safe
+  default (`completed: "24h"`, `failed: "7d"`, `cancelled: "24h"`) when not
+  configured, so a durable instance's state — which outlives its BullMQ jobs (the
+  original job completes on the first yield, resume ticks are removed immediately)
+  — no longer accumulates in the store forever. Set `retention` explicitly to
+  override; the dashboard self-heals the index on cancel/delete and the runtime
+  prunes expired index entries itself (no dashboard required).
+
 ## [0.1.1] - 2026-06-24
 
 ### Added

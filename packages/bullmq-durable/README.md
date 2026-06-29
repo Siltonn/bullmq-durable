@@ -3,11 +3,15 @@
 **Durable execution for [BullMQ](https://docs.bullmq.io) jobs.** Checkpoint, retry, sleep, and resume long-running jobs with a simple step API.
 
 ```ts
-new DurableWorker("generation", async (job, ctx) => {
-  const task = await ctx.step("create-task", () => createTask(job.data))
-  await ctx.sleep("wait", "10s")
-  return ctx.step("save-result", () => saveResult(task.id))
-}, { connection })
+new DurableWorker(
+  "generation",
+  async (job, ctx) => {
+    const task = await ctx.step("create-task", () => createTask(job.data))
+    await ctx.sleep("wait", "10s")
+    return ctx.step("save-result", () => saveResult(task.id))
+  },
+  { connection },
+)
 ```
 
 `bullmq-durable` does **not** replace BullMQ and is **not** a full workflow engine like Temporal. It adds a thin durable-execution layer on top of BullMQ so a single job can be split into **checkpointed steps** that survive crashes, restarts, and retries.
@@ -62,11 +66,11 @@ transactions, exactly-once delivery, or a permanent storage guarantee.
 
 They solve different problems:
 
-| | BullMQ Flow | bullmq-durable |
-| --- | --- | --- |
-| A workflow is… | many jobs in a DAG | one job split into durable steps |
-| Unit of execution | the job | the **durable instance** (survives resumes) |
-| Best for | fan-out / fan-in pipelines | long, linear, side-effectful jobs |
+|                   | BullMQ Flow                | bullmq-durable                              |
+| ----------------- | -------------------------- | ------------------------------------------- |
+| A workflow is…    | many jobs in a DAG         | one job split into durable steps            |
+| Unit of execution | the job                    | the **durable instance** (survives resumes) |
+| Best for          | fan-out / fan-in pipelines | long, linear, side-effectful jobs           |
 
 A BullMQ job is still the unit of work — `bullmq-durable` just lets that one job
 checkpoint, sleep, retry, and resume internally.
@@ -211,17 +215,21 @@ Each step has an independent retry policy (this is **step-level** retry, distinc
 from BullMQ's job-level `attempts`):
 
 ```ts
-await ctx.step("generate", {
-  retry: {
-    attempts: 3,            // total attempts, including the first (default: 1)
-    backoff: "exponential", // "fixed" | "exponential" (default: "fixed")
-    delay: "10s",           // base delay (default: 0)
-    maxDelay: "5m",         // optional cap for exponential backoff
+await ctx.step(
+  "generate",
+  {
+    retry: {
+      attempts: 3, // total attempts, including the first (default: 1)
+      backoff: "exponential", // "fixed" | "exponential" (default: "fixed")
+      delay: "10s", // base delay (default: 0)
+      maxDelay: "5m", // optional cap for exponential backoff
+    },
   },
-}, generate)
+  generate,
+)
 ```
 
-Backoff before the *n*-th retry:
+Backoff before the _n_-th retry:
 
 - `fixed` → `delay`
 - `exponential` → `delay * 2^(n-1)`, capped at `maxDelay` (which defaults to a
@@ -340,7 +348,10 @@ import {
 @DurableProcessor("generation")
 export class GenerationProcessor {
   @DurableProcess("video")
-  async run(job: DurableJob<CreateVideoInput, VideoResult>, ctx: DurableContext): Promise<VideoResult> {
+  async run(
+    job: DurableJob<CreateVideoInput, VideoResult>,
+    ctx: DurableContext,
+  ): Promise<VideoResult> {
     const task = await ctx.step("create-task", () => createVideoTask(job.data))
     await ctx.sleep("wait-first-poll", "10s")
     return ctx.step("save-asset", () => saveVideoAsset(task.id))
@@ -349,7 +360,9 @@ export class GenerationProcessor {
 
 @Injectable()
 export class GenerationService {
-  constructor(@InjectDurableQueue("generation") private readonly queue: DurableQueue<GenerationJobs>) {}
+  constructor(
+    @InjectDurableQueue("generation") private readonly queue: DurableQueue<GenerationJobs>,
+  ) {}
 
   createVideo(input: CreateVideoInput) {
     return this.queue.add("video", input, { jobId: input.generationId })
@@ -395,7 +408,7 @@ new DurableWorker<GenerationJobs>(
 - **Idempotency**: give every external side effect an idempotency key
   (`ctx.stepId(...)`) and write critical final state to your own DB.
 - **Step hygiene**: keep step keys stable; don't store huge results in a step;
-  don't perform side effects *outside* a step.
+  don't perform side effects _outside_ a step.
 - **Concurrency**: a per-instance lock (default TTL `5m`) prevents two workers
   from advancing the same instance at once. Tune `lockTimeout` to comfortably
   exceed your longest single tick.
@@ -409,6 +422,13 @@ new DurableWorker("generation", processor, {
   defaultStepOptions: { retry: { attempts: 3, backoff: "exponential", delay: "5s" } },
 })
 ```
+
+> **Retention is independent of the queue's job retention.** A durable instance
+> outlives its BullMQ jobs (the original job completes on the first yield; resume
+> ticks are removed immediately), so its state is the persistent record and is
+> bounded by `retention`, not `removeOnComplete`. It defaults to
+> `{ completed: "24h", failed: "7d", cancelled: "24h" }` so finished instances
+> never pile up unconfigured — set `retention` to tune or extend it.
 
 ## 12. Limitations
 
@@ -433,13 +453,13 @@ new DurableWorker("generation", processor, {
 
 ### `new DurableQueue(name, options)`
 
-| Option | Type | Description |
-| --- | --- | --- |
-| `connection` | `ConnectionOptions` | BullMQ/ioredis connection. |
-| `stateStore?` | `StateStore` | Custom store (defaults to `RedisStateStore`). |
-| `durablePrefix?` | `string` | Redis key prefix for durable state (`"bullmq-durable"`). |
-| `bullPrefix?` | `string` | BullMQ's own key prefix. |
-| `defaultJobOptions?` | `JobsOptions` | Default BullMQ job options. |
+| Option               | Type                | Description                                              |
+| -------------------- | ------------------- | -------------------------------------------------------- |
+| `connection`         | `ConnectionOptions` | BullMQ/ioredis connection.                               |
+| `stateStore?`        | `StateStore`        | Custom store (defaults to `RedisStateStore`).            |
+| `durablePrefix?`     | `string`            | Redis key prefix for durable state (`"bullmq-durable"`). |
+| `bullPrefix?`        | `string`            | BullMQ's own key prefix.                                 |
+| `defaultJobOptions?` | `JobsOptions`       | Default BullMQ job options.                              |
 
 Methods: `add(name, data, opts?)`, `getDurableState(jobId)`,
 `getDurableSteps(jobId)`, `getDurableLogs(jobId)`, `cancel(jobId)`, `close()`,
@@ -458,22 +478,31 @@ retried rather than stranding the instance.
 
 ### `ctx`
 
-| Member | Description |
-| --- | --- |
-| `step(key, fn)` / `step(key, options, fn)` | Run-once, checkpointed work. |
-| `sleep(key, duration)` | Pause for a duration. |
-| `sleepUntil(key, date)` | Pause until a wall-clock time. |
-| `retryLater(reason?)` / `retryLater(delay, reason?)` | Re-run this step later. |
-| `nonRetryable(reason)` | Fail the instance immediately. |
-| `log(message, meta?)` | Append a structured log (mirrored to the BullMQ job). |
-| `stepId(key)` | Deterministic id for a step (idempotency key). |
-| `instanceId` / `runCount` | The instance id and current run count. |
+| Member                                               | Description                                           |
+| ---------------------------------------------------- | ----------------------------------------------------- |
+| `step(key, fn)` / `step(key, options, fn)`           | Run-once, checkpointed work.                          |
+| `sleep(key, duration)`                               | Pause for a duration.                                 |
+| `sleepUntil(key, date)`                              | Pause until a wall-clock time.                        |
+| `retryLater(reason?)` / `retryLater(delay, reason?)` | Re-run this step later.                               |
+| `nonRetryable(reason)`                               | Fail the instance immediately.                        |
+| `log(message, meta?)`                                | Append a structured log (mirrored to the BullMQ job). |
+| `stepId(key)`                                        | Deterministic id for a step (idempotency key).        |
+| `instanceId` / `runCount`                            | The instance id and current run count.                |
 
 ### Stores
 
 - `RedisStateStore` — default, production.
 - `MemoryStateStore` — in-process, for tests.
 - Implement the `StateStore` interface for anything else (e.g. Postgres).
+
+### Status index (for the dashboard)
+
+`RedisStateStore` maintains a small secondary index (`{prefix}:idx:*`) so an
+observer like [bullmq-studio](../bullmq-studio) can read per-status counts and
+the in-flight set **without scanning** the keyspace. It is additive (it never
+changes the instance/steps/logs layout), kept in lock-step with every status
+transition from the first instance, and bounded by the same retention TTL as the
+instance state — so there is nothing to configure or run.
 
 ---
 
