@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cockpit",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "packages/bullmq-cockpit/dist/cli/index.js",
+        "--redis",
+        "redis://127.0.0.1:6379",
+        "--port",
+        "3099"
+      ],
+      "port": 3099
+    },
+    {
+      "name": "cockpit-dev",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "bullmq-cockpit", "dev"],
+      "port": 3010
+    }
+  ]
+}

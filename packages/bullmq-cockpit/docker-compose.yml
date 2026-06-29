@@ -1,0 +1,17 @@
+# A throwaway Redis for local development of bullmq-cockpit.
+#
+#   docker compose -f packages/bullmq-cockpit/docker-compose.yml up -d
+#   pnpm --filter bullmq-cockpit seed
+#   pnpm --filter bullmq-cockpit dev
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: bullmq-cockpit-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - bullmq-cockpit-redis:/data
+
+volumes:
+  bullmq-cockpit-redis:

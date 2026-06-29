@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BullMQ Cockpit</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%236366f1'/%3E%3Cpath d='M7 8h10M7 12h10M7 16h6' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+    <!--__BULLMQ_COCKPIT_CONFIG__-->
+    <script>
+      // The server injects the real config above; this is the dev/standalone
+      // fallback so the SPA boots when Vite serves the HTML directly.
+      window.__BULLMQ_COCKPIT__ = window.__BULLMQ_COCKPIT__ || {
+        basePath: "",
+        durableEnabled: true,
+        readonly: false,
+        permissions: [],
+        version: "dev",
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

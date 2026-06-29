@@ -1,11 +1,27 @@
 # pnpm 11 reads project settings from this file (no longer from package.json).
 #
+# Workspace packages:
+#  - packages/bullmq-durable  durable execution runtime for BullMQ
+#  - packages/bullmq-cockpit   modern dashboard + durable instance inspector
+packages:
+  - "packages/*"
+
+# Force a single ioredis across the workspace. BullMQ and bullmq-cockpit both
+# depend on ioredis; without this, pnpm keeps two minor versions side by side,
+# whose nominally-identical types are not assignable to each other (and whose
+# `instanceof` checks would diverge at runtime).
+overrides:
+  ioredis: "5.11.1"
+
 # None of these dependencies need their install/build scripts, so we decline
 # them all (keeps `pnpm install` and the pre-run deps check clean):
-#  - esbuild ships a prebuilt per-platform binary package (@esbuild/<platform>)
+#  - esbuild ships a prebuilt per-platform binary package (@esbuild/<platform>),
+#    which is all Vite/tsup need; its postinstall only re-verifies that binary.
 #  - msgpackr-extract falls back to a pure-JS implementation
 #  - @nestjs/core's postinstall only prints a funding notice
+#  - @heroui/shared-utils' build step is not needed from the published package
 allowBuilds:
+  "@heroui/shared-utils": false
   "@nestjs/core": false
   esbuild: false
   msgpackr-extract: false
