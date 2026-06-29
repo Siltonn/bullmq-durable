@@ -16,6 +16,11 @@ new DurableWorker(
 
 `bullmq-durable` does **not** replace BullMQ and is **not** a full workflow engine like Temporal. It adds a thin durable-execution layer on top of BullMQ so a single job can be split into **checkpointed steps** that survive crashes, restarts, and retries.
 
+> 💡 **Watch your instances run.** [`bullmq-cockpit`](../bullmq-cockpit) is a
+> dashboard that auto-detects `bullmq-durable` state in Redis and renders step
+> timelines, sleep / retry / resume controls, and stuck detection — no extra
+> wiring.
+
 ---
 
 ## Table of contents
@@ -447,7 +452,9 @@ new DurableWorker("generation", processor, {
 - `ctx.waitForEvent` + external `queue.sendEvent`
 - `ctx.parallel` / `ctx.race`
 - Step compensation (`compensate`) for Saga-style rollbacks
-- A read-only dashboard / inspection API
+
+> A read-only dashboard / inspection API has shipped — see
+> [`bullmq-cockpit`](../bullmq-cockpit).
 
 ## 14. API reference
 

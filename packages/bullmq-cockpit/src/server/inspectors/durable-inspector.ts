@@ -113,7 +113,10 @@ export class DurableInspector {
    */
   async listInstances(query: DurableInstanceQuery): Promise<DurableInstanceList> {
     const page = Math.max(1, query.page)
-    const { instances, truncated, indexTotal, windowed } = await this.loadListCandidates(query, page)
+    const { instances, truncated, indexTotal, windowed } = await this.loadListCandidates(
+      query,
+      page,
+    )
     let summaries = await this.summarizeInstances(instances)
     summaries = this.applyFilters(summaries, query)
     summaries = this.applySort(summaries, query)

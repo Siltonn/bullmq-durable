@@ -2,6 +2,8 @@
 
 Modern dashboard and durable instance inspector for [BullMQ](https://docs.bullmq.io/).
 
+![BullMQ Cockpit — the Overview: four golden signals, a Needs-attention banner, and a worst-first grid of queue-composition cards](docs/overview.png)
+
 `bullmq-cockpit` is an embeddable, framework-agnostic admin UI for any BullMQ
 deployment. It works out of the box for **plain BullMQ** users (queues, jobs,
 actions) and lights up a first-class **durable inspector** when it detects
@@ -143,6 +145,8 @@ Permissions: `queue:read|write`, `job:read|write`,
 In `readonly` mode every write permission is stripped regardless of the hook.
 
 ## Durable inspector
+
+![A durable instance in the inspector: status + metadata header, and an execution timeline of steps, retries, sleeps and logs with per-step durations](docs/durable-inspector.png)
 
 When durable support is on, the **Durable** section lists instances with their
 derived status (the runtime's coarse `yielded` is split into `sleeping`,

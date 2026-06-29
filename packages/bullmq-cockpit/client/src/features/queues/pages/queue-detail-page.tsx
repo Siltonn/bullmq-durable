@@ -193,7 +193,8 @@ export function QueueDetailPage({ queueName }: { queueName: string }) {
         <Card shadow="none" className="glass-card lg:col-span-1">
           <CardHeader className="pb-0">
             <h3 className="flex items-center gap-2 text-sm font-medium text-foreground-600">
-              <CockpitIcon name="jobs" width={16} className="text-foreground-400" /> Job distribution
+              <CockpitIcon name="jobs" width={16} className="text-foreground-400" /> Job
+              distribution
             </h3>
           </CardHeader>
           <CardBody>

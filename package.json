@@ -19,7 +19,11 @@
     "format:check": "prettier --check \"packages/*/{src,test,examples,client}/**/*.{ts,tsx}\"",
     "dev:cockpit": "pnpm --filter bullmq-cockpit dev",
     "build:durable": "pnpm --filter bullmq-durable build",
-    "build:cockpit": "pnpm --filter bullmq-cockpit build"
+    "build:cockpit": "pnpm --filter bullmq-cockpit build",
+    "publish:durable": "pnpm --filter bullmq-durable publish",
+    "publish:cockpit": "pnpm --filter bullmq-cockpit publish",
+    "publish:all": "pnpm -r publish",
+    "publish:dry": "pnpm -r publish --dry-run --no-git-checks"
   },
   "devDependencies": {
     "prettier": "^3.3.3"

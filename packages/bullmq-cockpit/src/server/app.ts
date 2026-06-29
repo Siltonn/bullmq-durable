@@ -11,7 +11,11 @@ import { authMiddleware, effectivePermissions, type CockpitVariables } from "./m
 import { registerClient } from "./client"
 import { createBoardContext, type BoardContext } from "./context"
 import { HttpError } from "./http/http-error"
-import { normalizeOptions, type BullMQCockpitOptions, type NormalizedCockpitOptions } from "./options"
+import {
+  normalizeOptions,
+  type BullMQCockpitOptions,
+  type NormalizedCockpitOptions,
+} from "./options"
 import { alertRoutes } from "./routes/alerts"
 import { durableRoutes } from "./routes/durable"
 import { flowRoutes } from "./routes/flows"

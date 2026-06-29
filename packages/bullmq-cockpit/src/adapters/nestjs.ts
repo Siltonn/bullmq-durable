@@ -42,7 +42,9 @@ export class BullMQCockpitModule implements NestModule {
     const cockpit = createCockpitApp({ ...options, basePath: path })
     return {
       module: BullMQCockpitModule,
-      providers: [{ provide: COCKPIT_OPTIONS, useValue: { cockpit, path } satisfies ResolvedModule }],
+      providers: [
+        { provide: COCKPIT_OPTIONS, useValue: { cockpit, path } satisfies ResolvedModule },
+      ],
     }
   }
 
