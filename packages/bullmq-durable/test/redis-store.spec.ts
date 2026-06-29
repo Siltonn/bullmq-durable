@@ -176,6 +176,68 @@ describeRedis("RedisStateStore (integration)", () => {
     expect(ttl).toBeGreaterThan(0)
   })
 
+  const zscore = async (bucket: string, id: string): Promise<number | null> => {
+    const s = await admin.zscore(`${prefix}:idx:done:${bucket}`, id)
+    return s === null ? null : Number(s)
+  }
+
+  it("moves an instance active -> done bucket (scored by expiry) + TTL on a terminal transition", async () => {
+    const id = newId()
+    await init(id)
+    expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(1)
+
+    const before = Date.now()
+    await store.completeInstance(id, { ok: true }, 60_000)
+
+    // Atomic: left the active set, entered done:completed scored by real expiry,
+    // and the data key got a TTL — all in one transition (no sentinel/no leak).
+    expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(0)
+    const score = await zscore("completed", id)
+    expect(score).not.toBeNull()
+    expect(score ?? 0).toBeGreaterThanOrEqual(before + 60_000)
+    expect(await admin.pttl(`${prefix}:instance:${id}`)).toBeGreaterThan(0)
+  })
+
+  it("clears a stale done entry when a reused id is re-created", async () => {
+    const id = newId()
+    await init(id)
+    await store.completeInstance(id, { ok: true }, 60_000)
+    expect(await zscore("completed", id)).not.toBeNull()
+
+    // Simulate the hash expiring while the lingering index entry survives, then
+    // re-enqueue the same id (a reused BullMQ job id).
+    await admin.del(`${prefix}:instance:${id}`)
+    await init(id)
+
+    expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(1)
+    expect(await zscore("completed", id)).toBeNull() // no phantom "done" double-count
+  })
+
+  it("applies cancelled retention + index move on an external queue.cancel()", async () => {
+    const queue = new DurableQueue("rq-cancel-ret", {
+      connection: { host: REDIS_HOST, port: REDIS_PORT },
+      stateStore: store,
+    })
+    try {
+      const id = queue.instanceIdFor("1")
+      await store.initInstance({
+        instanceId: id,
+        queueName: "rq-cancel-ret",
+        jobName: "job",
+        jobId: "1",
+        input: {},
+      })
+      await queue.cancel("1")
+
+      expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(0)
+      expect(await zscore("cancelled", id)).not.toBeNull()
+      expect(await admin.pttl(`${prefix}:instance:${id}`)).toBeGreaterThan(0)
+    } finally {
+      await queue.bull.obliterate({ force: true }).catch(() => undefined)
+      await queue.close()
+    }
+  })
+
   it("schedules resume jobs with attempts > 1 so a failed resume tick self-heals", async () => {
     const queue = new DurableQueue("rq-resume", {
       connection: { host: REDIS_HOST, port: REDIS_PORT },

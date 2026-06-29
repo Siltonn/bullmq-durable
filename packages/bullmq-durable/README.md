@@ -498,7 +498,7 @@ retried rather than stranding the instance.
 ### Status index (for the dashboard)
 
 `RedisStateStore` maintains a small secondary index (`{prefix}:idx:*`) so an
-observer like [bullmq-studio](../bullmq-studio) can read per-status counts and
+observer like [bullmq-cockpit](../bullmq-cockpit) can read per-status counts and
 the in-flight set **without scanning** the keyspace. It is additive (it never
 changes the instance/steps/logs layout), kept in lock-step with every status
 transition from the first instance, and bounded by the same retention TTL as the

@@ -66,15 +66,16 @@ export function resumeJobId(originalJobId: string, resumeSeq: number): string {
 // Status index — the bundled RedisStateStore's on-disk optimization
 // ---------------------------------------------------------------------------
 //
-// To let a read-only observer (the bullmq-studio dashboard) answer "how many
+// To let a read-only observer (the bullmq-cockpit dashboard) answer "how many
 // instances are in each status?" and "which instances are in flight?" WITHOUT a
 // full keyspace `SCAN`, the RedisStateStore maintains a small secondary index,
 // kept in lock-step with every status transition (see redis-store.ts).
 //
 // It is **purely additive**: it never alters the instance/steps/logs/lock layout
 // above, and it is **not** part of the StateStore contract — a custom store
-// simply won't have it, and a reader falls back. Treat it as an optimization,
-// never as the source of truth for an individual instance.
+// simply won't maintain it (so the dashboard, which reads the index directly,
+// only sees instances written through the bundled Redis store). Treat it as an
+// optimization, never as the source of truth for an individual instance.
 
 /** ZSET score meaning "this terminal instance has no retention TTL, so it never
  *  expires and must never be pruned." Chosen far beyond any realistic epoch-ms
@@ -91,9 +92,12 @@ export function activeIndexKey(prefix: string): string {
 }
 
 /** `{prefix}:idx:done:{status}` — ZSET of terminal instance ids, scored by the
- *  epoch-ms at which the instance should expire ({@link INDEX_NEVER_EXPIRES}
- *  when un-retained). The score lets a reader prune retention-expired ids with a
- *  single `ZREMRANGEBYSCORE … -inf <now>` so `ZCARD` stays exact. */
+ *  epoch-ms at which the instance should expire ({@link INDEX_NEVER_EXPIRES} when
+ *  un-retained). Scoring by expiry lets a reader count or list only the still-live
+ *  ids *by score* (`ZCOUNT '(now' '+inf'`, `ZREVRANGEBYSCORE '+inf' '(now'`) —
+ *  exact and read-only, whether or not expired entries have been physically
+ *  removed yet. The runtime prunes them on each terminal transition (and on
+ *  `expireInstance`) via `ZREMRANGEBYSCORE … -inf <now>`. */
 export function terminalIndexKey(prefix: string, status: TerminalStatus): string {
   return `${prefix}:idx:done:${status}`
 }

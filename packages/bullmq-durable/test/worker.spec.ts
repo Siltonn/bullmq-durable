@@ -125,20 +125,22 @@ describe("instance lifecycle", () => {
 })
 
 describe("retention", () => {
-  it("expires a completed instance using the completed ttl", async () => {
+  it("bounds a completed instance with the completed ttl (atomic with the transition)", async () => {
     const store = new MemoryStateStore()
-    const spy = vi.spyOn(store, "expireInstance")
+    const spy = vi.spyOn(store, "completeInstance")
     const engine = new TestEngine(async () => "done", {
       store,
       retention: { completed: "7d", failed: "30d" },
     })
     await engine.run("job", {}, "1")
-    expect(spy).toHaveBeenCalledWith(engine.instanceId("1"), parseDuration("7d"))
+    // Retention is folded into the terminal transition, not a separate
+    // expireInstance call, so a crash can't leave the finished state un-expired.
+    expect(spy).toHaveBeenCalledWith(engine.instanceId("1"), "done", parseDuration("7d"))
   })
 
-  it("expires a failed instance using the failed ttl", async () => {
+  it("bounds a failed instance with the failed ttl (atomic with the transition)", async () => {
     const store = new MemoryStateStore()
-    const spy = vi.spyOn(store, "expireInstance")
+    const spy = vi.spyOn(store, "failInstance")
     const engine = new TestEngine(
       async () => {
         throw new Error("nope")
@@ -146,7 +148,11 @@ describe("retention", () => {
       { store, retention: { completed: "7d", failed: "30d" } },
     )
     await engine.run("job", {}, "1")
-    expect(spy).toHaveBeenCalledWith(engine.instanceId("1"), parseDuration("30d"))
+    expect(spy).toHaveBeenCalledWith(
+      engine.instanceId("1"),
+      expect.any(Error),
+      parseDuration("30d"),
+    )
   })
 })
 

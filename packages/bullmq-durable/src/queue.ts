@@ -27,6 +27,8 @@ import type {
 } from "./types"
 import { createInstanceId, DEFAULT_DURABLE_PREFIX, resumeJobId } from "./utils/keys"
 import { wrapResumeData } from "./envelope"
+import { DEFAULT_RETENTION } from "./types"
+import { parseDuration } from "./utils/duration"
 
 /** BullMQ attempts for resume ticks when the caller does not override it. */
 const DEFAULT_RESUME_ATTEMPTS = 3
@@ -142,8 +144,13 @@ export class DurableQueue<TJobs extends DurableJobMap = DurableJobMap> implement
    */
   async cancel(jobId: string | number): Promise<void> {
     const instanceId = this.instanceIdFor(jobId)
-    await this.stateStore.cancelInstance(instanceId)
+    // Read the instance first (for its resumeSeq), then cancel WITH the default
+    // cancelled-retention TTL so an externally-cancelled instance is bounded just
+    // like an in-workflow cancel. The queue can't see the worker's configured
+    // `retention`, so it uses the safe default (matching the dashboard); without
+    // it the cancelled state and its index entry would never expire.
     const instance = await this.stateStore.getInstance(instanceId)
+    await this.stateStore.cancelInstance(instanceId, parseDuration(DEFAULT_RETENTION.cancelled))
 
     try {
       await this.removeJob(String(jobId))

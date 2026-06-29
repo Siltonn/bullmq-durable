@@ -37,14 +37,19 @@ export interface StateStore {
   /** Shallow-merge a patch into an instance and return the updated state. */
   updateInstance(instanceId: string, patch: Partial<InstanceState>): Promise<InstanceState | null>
 
-  /** Mark an instance completed and store its output. */
-  completeInstance(instanceId: string, output: unknown): Promise<void>
+  /**
+   * Mark an instance completed and store its output. When `ttlMs` is supplied the
+   * store should also bound the finished instance with that retention TTL as part
+   * of the same transition (the bundled Redis store does both atomically, so a
+   * crash can't leave terminal state un-expired).
+   */
+  completeInstance(instanceId: string, output: unknown, ttlMs?: number): Promise<void>
 
-  /** Mark an instance failed and store the serialized error. */
-  failInstance(instanceId: string, error: unknown): Promise<void>
+  /** Mark an instance failed and store the serialized error (see `completeInstance` re `ttlMs`). */
+  failInstance(instanceId: string, error: unknown, ttlMs?: number): Promise<void>
 
-  /** Mark an instance cancelled. */
-  cancelInstance(instanceId: string): Promise<void>
+  /** Mark an instance cancelled (see `completeInstance` re `ttlMs`). */
+  cancelInstance(instanceId: string, ttlMs?: number): Promise<void>
 
   /** Atomically allocate the next resume sequence number for an instance. */
   nextResumeSeq(instanceId: string): Promise<number>

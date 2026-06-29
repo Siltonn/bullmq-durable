@@ -13,8 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintains an additive `{prefix}:idx:*` index from the first instance, kept in
   lock-step with every status transition, so per-status counts and the in-flight
   set can be read without scanning Redis. It lives inside the bundled Redis store
-  (no `StateStore` interface change), and is bounded by the same retention TTL as
-  the instance state.
+  and is bounded by the same retention TTL as the instance state.
 - `RetentionOptions.cancelled` — TTL for cancelled instances (defaults to `"24h"`).
 
 ### Changed
@@ -24,8 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured, so a durable instance's state — which outlives its BullMQ jobs (the
   original job completes on the first yield, resume ticks are removed immediately)
   — no longer accumulates in the store forever. Set `retention` explicitly to
-  override; the dashboard self-heals the index on cancel/delete and the runtime
-  prunes expired index entries itself (no dashboard required).
+  override.
+- **Terminal transitions are now atomic with retention.** `StateStore`'s
+  `completeInstance` / `failInstance` / `cancelInstance` take an optional `ttlMs`;
+  the bundled Redis store applies the status change, the index move, the retention
+  TTL and the bucket prune in a single Lua script, so a crash can never leave a
+  finished instance un-expired or its index entry un-pruned. `DurableQueue.cancel()`
+  applies the default cancelled retention too. The new parameter is optional, so
+  existing custom `StateStore` implementations keep working unchanged.
+
+### Fixed
+
+- A reused BullMQ job id no longer leaves a phantom entry in the status index: a
+  fresh instance clears any stale terminal-bucket entry under the same id on init,
+  so it is never counted as both in-flight and finished.
 
 ## [0.1.1] - 2026-06-24
 

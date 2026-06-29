@@ -148,8 +148,7 @@ export class DurableRuntime {
 
     try {
       const output = await processor(this.params.job as DurableJob, ctx)
-      await store.completeInstance(instanceId, output)
-      await this.applyRetention("completed")
+      await store.completeInstance(instanceId, output, this.retentionMs("completed"))
       return { type: "completed", output }
     } catch (error) {
       if (error instanceof DurableYieldError) {
@@ -158,25 +157,23 @@ export class DurableRuntime {
         return { type: "yielded", resume: ctx.takePendingResume() }
       }
       if (error instanceof DurableCancelledError) {
-        await store.cancelInstance(instanceId)
-        await this.applyRetention("cancelled")
+        await store.cancelInstance(instanceId, this.retentionMs("cancelled"))
         return { type: "cancelled" }
       }
-      await store.failInstance(instanceId, error)
-      await this.applyRetention("failed")
+      await store.failInstance(instanceId, error, this.retentionMs("failed"))
       return { type: "failed", error, fresh: true }
     }
   }
 
   /**
-   * Bound a finished instance's state with a retention TTL once it reaches a
-   * terminal state. Falls back to {@link DEFAULT_RETENTION} when unconfigured, so
-   * the store never accumulates finished instances forever — applied for every
-   * terminal status (completed / failed / cancelled).
+   * Resolve the retention TTL (ms) for a terminal status, falling back to
+   * {@link DEFAULT_RETENTION} when unconfigured. Passed straight into the terminal
+   * transition so a finished instance is bounded atomically — the store never
+   * accumulates finished instances forever, and there is no window between the
+   * status flip and the TTL where a crash could leak un-expired state.
    */
-  private async applyRetention(kind: keyof RetentionOptions): Promise<void> {
-    const ttl = this.params.retention?.[kind] ?? DEFAULT_RETENTION[kind]
-    await this.params.store.expireInstance(this.params.instanceId, parseDuration(ttl))
+  private retentionMs(kind: keyof RetentionOptions): number {
+    return parseDuration(this.params.retention?.[kind] ?? DEFAULT_RETENTION[kind])
   }
 
   /**

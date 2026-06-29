@@ -72,7 +72,7 @@ export class MemoryStateStore implements StateStore {
     return cloneValue(record.instance)
   }
 
-  async completeInstance(instanceId: string, output: unknown): Promise<void> {
+  async completeInstance(instanceId: string, output: unknown, ttlMs?: number): Promise<void> {
     const record = this.live(instanceId)
     if (!record) return
     const now = Date.now()
@@ -83,9 +83,10 @@ export class MemoryStateStore implements StateStore {
       completedAt: now,
       updatedAt: now,
     }
+    if (ttlMs !== undefined) record.expiresAt = now + ttlMs
   }
 
-  async failInstance(instanceId: string, error: unknown): Promise<void> {
+  async failInstance(instanceId: string, error: unknown, ttlMs?: number): Promise<void> {
     const record = this.live(instanceId)
     if (!record) return
     const now = Date.now()
@@ -96,12 +97,15 @@ export class MemoryStateStore implements StateStore {
       failedAt: now,
       updatedAt: now,
     }
+    if (ttlMs !== undefined) record.expiresAt = now + ttlMs
   }
 
-  async cancelInstance(instanceId: string): Promise<void> {
+  async cancelInstance(instanceId: string, ttlMs?: number): Promise<void> {
     const record = this.live(instanceId)
     if (!record) return
-    record.instance = { ...record.instance, status: "cancelled", updatedAt: Date.now() }
+    const now = Date.now()
+    record.instance = { ...record.instance, status: "cancelled", updatedAt: now }
+    if (ttlMs !== undefined) record.expiresAt = now + ttlMs
   }
 
   async nextResumeSeq(instanceId: string): Promise<number> {

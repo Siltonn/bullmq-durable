@@ -41,15 +41,23 @@ const DEFAULT_MAX_LOGS = 1000
 // Atomic create-if-absent. Returns 1 when the instance was created, 0 if it
 // already existed (so the caller reads the stored state instead).
 //
-// KEYS: [1] instance hash, [2] idx:active set.
+// KEYS: [1] instance hash, [2] idx:active, [3] idx:done:completed,
+//       [4] idx:done:failed, [5] idx:done:cancelled.
 // ARGV: [1] instance id, [2..] HSET field pairs.
 // New instances start `running` (non-terminal), so they join the active set in
 // the same atomic step as the hash write — the index can never drift from state.
+// Creating a fresh instance also clears any stale terminal-index entry left by a
+// PRIOR run under the same id (a reused BullMQ job id whose done-bucket entry
+// outlived its expired hash), so a reused id is never double-counted (a phantom
+// in a done bucket while the new run is active).
 const INIT_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 0
 end
 redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+redis.call('ZREM', KEYS[3], ARGV[1])
+redis.call('ZREM', KEYS[4], ARGV[1])
+redis.call('ZREM', KEYS[5], ARGV[1])
 redis.call('SADD', KEYS[2], ARGV[1])
 return 1
 `
@@ -86,6 +94,31 @@ if new ~= '' and new ~= old then
     redis.call('SADD', KEYS[2], ARGV[1])
   end
 end
+return 1
+`
+
+// Atomic terminal transition WITH retention, in one round-trip: flip the status,
+// move the id out of the active set into its done-bucket scored by real expiry
+// (now + ttl), prune already-expired ids from that bucket, and PEXPIRE the data
+// keys. Folding the transition and retention into one script means a crash can
+// never leave a terminal instance un-expired or its index entry stuck at a
+// never-expire sentinel — the failure mode of doing the transition and retention
+// as two separate calls.
+//
+// KEYS: [1] instance, [2] steps, [3] logs, [4] idx:active, [5] idx:done:<status>.
+// ARGV: [1] instance id, [2] ttlMs, [3] expiry score (now+ttlMs), [4] now (prune
+//       ceiling), [5..] HSET field pairs.
+const TERMINAL_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('HSET', KEYS[1], unpack(ARGV, 5))
+redis.call('SREM', KEYS[4], ARGV[1])
+redis.call('ZADD', KEYS[5], ARGV[3], ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', ARGV[4])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+redis.call('PEXPIRE', KEYS[3], ARGV[2])
 return 1
 `
 
@@ -150,8 +183,9 @@ export class RedisStateStore implements StateStore {
 
     // Register the Lua helpers as cached, named commands. The key counts must
     // match each script's KEYS arity (see the script comments above).
-    this.redis.defineCommand("durableInit", { numberOfKeys: 2, lua: INIT_SCRIPT })
+    this.redis.defineCommand("durableInit", { numberOfKeys: 5, lua: INIT_SCRIPT })
     this.redis.defineCommand("durableUpdate", { numberOfKeys: 5, lua: UPDATE_SCRIPT })
+    this.redis.defineCommand("durableTerminal", { numberOfKeys: 5, lua: TERMINAL_SCRIPT })
     this.redis.defineCommand("durableExpire", { numberOfKeys: 6, lua: EXPIRE_SCRIPT })
     this.redis.defineCommand("durableLockAcquire", { numberOfKeys: 1, lua: LOCK_ACQUIRE_SCRIPT })
     this.redis.defineCommand("durableLockRenew", { numberOfKeys: 1, lua: LOCK_RENEW_SCRIPT })
@@ -178,6 +212,9 @@ export class RedisStateStore implements StateStore {
     const created = (await this.cmd("durableInit")(
       this.instanceKey(input.instanceId),
       this.activeKey(),
+      this.terminalKey("completed"),
+      this.terminalKey("failed"),
+      this.terminalKey("cancelled"),
       input.instanceId,
       ...encodeInstanceFields(instance),
     )) as number
@@ -220,28 +257,68 @@ export class RedisStateStore implements StateStore {
     return this.getInstance(instanceId)
   }
 
-  async completeInstance(instanceId: string, output: unknown): Promise<void> {
+  async completeInstance(instanceId: string, output: unknown, ttlMs?: number): Promise<void> {
     const now = Date.now()
-    await this.updateInstance(instanceId, {
-      status: "completed",
-      output,
-      completedAt: now,
-      updatedAt: now,
-    })
+    await this.terminalTransition(
+      instanceId,
+      "completed",
+      { status: "completed", output, completedAt: now, updatedAt: now },
+      ttlMs,
+    )
   }
 
-  async failInstance(instanceId: string, error: unknown): Promise<void> {
+  async failInstance(instanceId: string, error: unknown, ttlMs?: number): Promise<void> {
     const now = Date.now()
-    await this.updateInstance(instanceId, {
-      status: "failed",
-      error: serializeError(error),
-      failedAt: now,
-      updatedAt: now,
-    })
+    await this.terminalTransition(
+      instanceId,
+      "failed",
+      { status: "failed", error: serializeError(error), failedAt: now, updatedAt: now },
+      ttlMs,
+    )
   }
 
-  async cancelInstance(instanceId: string): Promise<void> {
-    await this.updateInstance(instanceId, { status: "cancelled" })
+  async cancelInstance(instanceId: string, ttlMs?: number): Promise<void> {
+    await this.terminalTransition(
+      instanceId,
+      "cancelled",
+      { status: "cancelled", updatedAt: Date.now() },
+      ttlMs,
+    )
+  }
+
+  /**
+   * Move an instance to a terminal status. When `ttlMs` is given (the runtime
+   * always passes it, resolved from `retention` ?? DEFAULT_RETENTION), the status
+   * flip, index move, retention TTL and bucket prune happen in ONE atomic script
+   * (TERMINAL_SCRIPT) — no window where a crash could leave terminal state with no
+   * TTL and a never-pruned index entry. When omitted, it falls back to a plain
+   * status transition (index entry scored with the never-expire sentinel) so a
+   * caller can still apply retention later via `expireInstance`.
+   */
+  private async terminalTransition(
+    instanceId: string,
+    status: TerminalStatus,
+    patch: Partial<InstanceState>,
+    ttlMs: number | undefined,
+  ): Promise<void> {
+    if (ttlMs === undefined) {
+      await this.updateInstance(instanceId, patch)
+      return
+    }
+    const fields = encodeInstanceFields(patch)
+    const now = Date.now()
+    await this.cmd("durableTerminal")(
+      this.instanceKey(instanceId),
+      this.stepsKey(instanceId),
+      this.logsKey(instanceId),
+      this.activeKey(),
+      this.terminalKey(status),
+      instanceId,
+      String(ttlMs),
+      String(now + ttlMs),
+      String(now),
+      ...fields,
+    )
   }
 
   async nextResumeSeq(instanceId: string): Promise<number> {
