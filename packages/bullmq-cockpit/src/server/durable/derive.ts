@@ -52,10 +52,18 @@ export function deriveView(instance: StoredInstanceState, steps: StoredStepState
       return { derivedStatus: "completed" }
     case "failed":
       return { derivedStatus: "failed", currentStep: lastFailedStep(steps) }
+    case "compensation_failed":
+      return { derivedStatus: "compensation_failed", currentStep: lastFailedStep(steps) }
     case "cancelled":
       return { derivedStatus: "cancelled" }
     case "running":
       return { derivedStatus: "running", currentStep: latestRunningStep(steps) }
+    case "compensating":
+      // Parked while undoing side effects / running settlement.
+      return {
+        derivedStatus: "compensating",
+        currentStep: latestRunningStep(steps) ?? lastFailedStep(steps),
+      }
     case "yielded": {
       // A retry/`retryLater` parks on a still-`running` step with a `nextRunAt`.
       const retrying = [...steps].reverse().find(isInFlightRetry)
@@ -84,7 +92,9 @@ function latestRunningStep(steps: StoredStepState[]): StoredStepState | undefine
 }
 
 function lastFailedStep(steps: StoredStepState[]): StoredStepState | undefined {
-  return [...steps].reverse().find((s) => s.status === "failed")
+  // Only forward (`main`-phase) failures are the "point of failure" a user debugs;
+  // an internal __rollback__/__failure__ step that failed must not be surfaced here.
+  return [...steps].reverse().find((s) => s.status === "failed" && (s.phase ?? "main") === "main")
 }
 
 /**
@@ -121,6 +131,7 @@ function isTerminal(instance: StoredInstanceState): boolean {
   return (
     instance.status === "completed" ||
     instance.status === "failed" ||
+    instance.status === "compensation_failed" ||
     instance.status === "cancelled"
   )
 }
@@ -134,8 +145,10 @@ export function toStep(step: StoredStepState, now: number): DurableStep {
   return {
     key: step.key,
     type: step.type,
+    phase: step.phase ?? "main",
     status: step.status,
     attempts: step.attempts,
+    seq: step.seq,
     startedAt: step.startedAt,
     completedAt: step.completedAt,
     failedAt: step.failedAt,
@@ -145,6 +158,11 @@ export function toStep(step: StoredStepState, now: number): DurableStep {
     sleepUntil,
     error: step.error,
   }
+}
+
+/** A forward (`main`-phase) work step — what "progress" should count. */
+function isMainWorkStep(s: { type: StoredStepState["type"]; phase?: string }): boolean {
+  return s.type === "step" && (s.phase ?? "main") === "main"
 }
 
 export function toInstanceSummary(
@@ -167,10 +185,10 @@ export function toInstanceSummary(
     currentStepStatus: view.currentStep?.status,
     currentAttempts: view.currentStep?.attempts,
     currentMaxAttempts: undefined,
-    // Count work steps (`ctx.step`) only: the runtime stores each `ctx.sleep` as a
-    // completed step too, but elapsed sleeps are waits, not work progress.
-    stepCount: steps.filter((s) => s.type === "step").length,
-    completedSteps: steps.filter((s) => s.type === "step" && s.status === "completed").length,
+    // Count forward work steps (`ctx.step`) only: elapsed sleeps are waits, and
+    // internal compensation/failure steps must not inflate forward progress.
+    stepCount: steps.filter(isMainWorkStep).length,
+    completedSteps: steps.filter((s) => isMainWorkStep(s) && s.status === "completed").length,
     runCount: instance.runCount,
     resumeSeq: instance.resumeSeq,
     nextRunAt: view.nextRunAt,
@@ -197,9 +215,11 @@ export function toInstanceDetail(
     input: instance.input,
     output: instance.output,
     error: instance.error,
+    failedStep: instance.failedStep,
+    compensation: instance.compensation,
     steps: projected,
-    stepCount: projected.filter((s) => s.type === "step").length,
-    completedSteps: projected.filter((s) => s.type === "step" && s.status === "completed").length,
+    stepCount: projected.filter(isMainWorkStep).length,
+    completedSteps: projected.filter((s) => isMainWorkStep(s) && s.status === "completed").length,
   }
 }
 

@@ -48,11 +48,21 @@ export interface StateStore {
   /** Mark an instance failed and store the serialized error (see `completeInstance` re `ttlMs`). */
   failInstance(instanceId: string, error: unknown, ttlMs?: number): Promise<void>
 
+  /**
+   * Mark an instance `compensation_failed` — failed *and* one or more
+   * compensations could not be completed (see `completeInstance` re `ttlMs`).
+   * A distinct terminal state so it can be surfaced/alerted separately.
+   */
+  compensationFailedInstance(instanceId: string, error: unknown, ttlMs?: number): Promise<void>
+
   /** Mark an instance cancelled (see `completeInstance` re `ttlMs`). */
   cancelInstance(instanceId: string, ttlMs?: number): Promise<void>
 
   /** Atomically allocate the next resume sequence number for an instance. */
   nextResumeSeq(instanceId: string): Promise<number>
+
+  /** Atomically allocate the next per-step sequence number for an instance. */
+  nextStepSeq(instanceId: string): Promise<number>
 
   // -- Steps ---------------------------------------------------------------
 

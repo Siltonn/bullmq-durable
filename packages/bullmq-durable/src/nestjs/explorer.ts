@@ -17,10 +17,16 @@ import {
 import { DiscoveryService, ModuleRef, Reflector } from "@nestjs/core"
 import type { StateStore } from "../store/state-store"
 import { DurableWorker } from "../worker"
-import type { DurableProcessor, DurableWorkerOptions } from "../types"
+import type {
+  DurableFailureHandler,
+  DurableJobHandler,
+  DurableProcessor,
+  DurableWorkerOptions,
+} from "../types"
 import { reuseSharedStore } from "./shared-store"
 import {
   DURABLE_BULL_OPTIONS,
+  DURABLE_FAILURE_METADATA,
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,
   DURABLE_STATE_STORE,
@@ -29,6 +35,7 @@ import {
 } from "./tokens"
 import type {
   DurableBullRootOptions,
+  DurableFailureMetadata,
   DurableProcessMetadata,
   DurableProcessorMetadata,
   DurableQueueRegistration,
@@ -109,14 +116,19 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
     return this.workers.length
   }
 
-  /** Build a `{ jobName: boundMethod }` map from `@DurableProcess` methods. */
-  private buildHandlerMap(instance: object): Record<string, DurableProcessor> {
-    const handlers: Record<string, DurableProcessor> = {}
+  /**
+   * Build a `{ jobName: { run, onFailure? } }` map from `@DurableProcess` and
+   * `@DurableFailure` methods. A job with a sibling `@DurableFailure` gets its
+   * terminal-failure settlement wired automatically.
+   */
+  private buildHandlerMap(instance: object): Record<string, DurableJobHandler> {
+    const runs = new Map<string, DurableProcessor>()
+    const failures = new Map<string, DurableFailureHandler>()
     const seen = new Set<string>()
 
-    // Walk the whole prototype chain so `@DurableProcess` methods inherited from
-    // a base class are discovered too. A more-derived method shadows a base one
-    // of the same name (we visit derived prototypes first).
+    // Walk the whole prototype chain so decorated methods inherited from a base
+    // class are discovered too. A more-derived method shadows a base one of the
+    // same name (we visit derived prototypes first).
     let prototype = Object.getPrototypeOf(instance) as Record<string, unknown> | null
     while (prototype && prototype !== Object.prototype) {
       for (const propertyName of Object.getOwnPropertyNames(prototype)) {
@@ -130,15 +142,37 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
           DURABLE_PROCESS_METADATA,
           method,
         )
-        if (!processMeta) continue
+        if (processMeta && !runs.has(processMeta.jobName)) {
+          runs.set(processMeta.jobName, (method as DurableProcessor).bind(instance))
+        }
 
-        handlers[processMeta.jobName] = (method as DurableProcessor).bind(
-          instance,
-        ) as DurableProcessor
+        const failureMeta = this.reflector.get<DurableFailureMetadata>(
+          DURABLE_FAILURE_METADATA,
+          method,
+        )
+        if (failureMeta && !failures.has(failureMeta.jobName)) {
+          failures.set(failureMeta.jobName, (method as DurableFailureHandler).bind(instance))
+        }
       }
       prototype = Object.getPrototypeOf(prototype) as Record<string, unknown> | null
     }
 
+    // An @DurableFailure whose jobName has no @DurableProcess is almost certainly a
+    // typo — fail loudly rather than silently never wiring the settlement handler.
+    const orphans = [...failures.keys()].filter((jobName) => !runs.has(jobName))
+    if (orphans.length > 0) {
+      const cls = (instance as { constructor?: { name?: string } }).constructor?.name ?? "processor"
+      throw new Error(
+        `@DurableFailure for job(s) [${orphans.join(", ")}] on "${cls}" has no matching ` +
+          `@DurableProcess. Add a @DurableProcess("<job>") with the same job name.`,
+      )
+    }
+
+    const handlers: Record<string, DurableJobHandler> = {}
+    for (const [jobName, run] of runs) {
+      const onFailure = failures.get(jobName)
+      handlers[jobName] = onFailure ? { run, onFailure } : { run }
+    }
     return handlers
   }
 
@@ -160,6 +194,7 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
       lockTimeout: queue?.lockTimeout ?? root.lockTimeout,
       retention: queue?.retention ?? root.retention,
       defaultStepOptions: queue?.defaultStepOptions ?? root.defaultStepOptions,
+      defaultRollbackRetry: queue?.defaultRollbackRetry ?? root.defaultRollbackRetry,
       maxLogs: queue?.maxLogs ?? root.maxLogs,
       stateStore: reuseSharedStore(this.sharedStore, root, queue?.durablePrefix),
     }

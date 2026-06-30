@@ -2,12 +2,14 @@
  * Basic example: a durable "welcome email" job.
  *
  * Shows the three building blocks — `ctx.step` (checkpointed work), `ctx.sleep`
- * (pause without holding a worker), and a typed job map for end-to-end safety.
+ * (pause without holding a worker), and BullMQ-style payload typing: the queue
+ * is typed by its payload (`DurableQueue<Data, Result>`) and the job name is a
+ * free routing label.
  *
  * Run a Redis instance, then execute this file with `tsx` / `ts-node`.
  */
 
-import { DurableQueue, DurableWorker } from "bullmq-durable"
+import { DurableQueue, DurableWorker, type DurableJob } from "bullmq-durable"
 
 interface SendEmailInput {
   userId: string
@@ -16,19 +18,16 @@ interface SendEmailResult {
   sent: boolean
 }
 
-// A job map gives `queue.add` and the worker handlers full type inference.
-type EmailJobs = {
-  welcome: { data: SendEmailInput; result: SendEmailResult }
-}
-
 const connection = { host: "127.0.0.1", port: 6379 }
 
-export const queue = new DurableQueue<EmailJobs>("emails", { connection })
+// The queue is typed by its payload — no name->payload map to declare.
+export const queue = new DurableQueue<SendEmailInput, SendEmailResult>("emails", { connection })
 
-export const worker = new DurableWorker<EmailJobs>(
+export const worker = new DurableWorker(
   "emails",
   {
-    welcome: async (job, ctx) => {
+    // "welcome" is just a routing label; the handler types its own payload.
+    welcome: async (job: DurableJob<SendEmailInput, SendEmailResult>, ctx) => {
       // `job.data` is typed as SendEmailInput.
       const user = await ctx.step("load-user", () => loadUser(job.data.userId))
 

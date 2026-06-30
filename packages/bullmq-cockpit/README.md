@@ -43,8 +43,9 @@ retry / resume controls, and stuck detection.
 
 **Durable** (auto-detected from `bullmq-durable` state — see [Durable inspector](#durable-inspector))
 
-- step flow diagram, sleep / retry / resume controls, synthesized event feed,
-  inline durable panel on the job page, and four-class stuck detection.
+- step flow diagram, sleep / retry / resume controls, **saga compensation**
+  (rollback timeline + retry-compensation), synthesized event feed, inline durable
+  panel on the job page, and four-class stuck detection.
 
 ---
 
@@ -55,8 +56,9 @@ npx bullmq-cockpit --redis redis://localhost:6379 --queues generation,emails --p
 # → open http://localhost:3001
 ```
 
-The CLI auto-discovers queues if `--queues` is omitted. Run `bullmq-cockpit --help`
-for every flag (`--base-path`, `--readonly`, `--no-durable`, …).
+The CLI auto-discovers queues if `--queues` is omitted (scanned once at startup,
+then cached — restart to pick up new queues). Run `bullmq-cockpit --help` for
+every flag (`--base-path`, `--readonly`, `--no-durable`, …).
 
 ## Embedding
 
@@ -93,10 +95,50 @@ await fastify.register(createBullMQCockpit({ connection }), { prefix: "/admin/bu
 import { BullMQCockpitModule } from "bullmq-cockpit/nestjs"
 
 @Module({
-  imports: [BullMQCockpitModule.register({ path: "/admin/bullmq", connection })],
+  imports: [
+    BullMQCockpitModule.register({ path: "/admin/bullmq", connection, queues: ["emails"] }),
+  ],
 })
 export class AdminModule {}
 ```
+
+Under NestJS the dashboard **never auto-discovers** queues by scanning Redis — you
+declare them explicitly. List them at the root with `queues`, and/or contribute
+them from any feature module with `registerQueue` (mirrors
+`DurableBullModule.registerQueue`); the lists are merged:
+
+```ts
+@Module({
+  imports: [BullMQCockpitModule.registerQueue("media", "billing")],
+})
+export class MediaModule {}
+```
+
+Source `connection` (and `auth`) from DI with `registerAsync`:
+
+```ts
+@Module({
+  imports: [
+    BullMQCockpitModule.registerAsync({
+      path: "/admin/bullmq",
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+    }),
+  ],
+})
+export class AdminModule {}
+```
+
+The cockpit's Redis connections are built lazily and released automatically on
+application shutdown (enable `app.enableShutdownHooks()` to also release them on
+`SIGTERM`/`SIGINT`).
+
+Two caveats: this module targets the **default Express platform** — on
+`@nestjs/platform-fastify`, mount [`bullmq-cockpit/fastify`](#fastify) directly.
+And because the dashboard mounts as middleware, Nest guards/interceptors don't run
+for its routes — put authorization in the `auth` hook (whose `req` is the raw
+request).
 
 ### Hono (directly)
 
@@ -153,9 +195,16 @@ derived status (the runtime's coarse `yielded` is split into `sleeping`,
 `retrying`, `waiting`). The detail view shows:
 
 - a **step timeline** (`✓ completed · 421ms`, `↻ retrying · attempt 12 · next in 8s`, …),
+  with `ROLLBACK` / `SETTLE` tags for compensation and `onFailure` steps,
 - per-step result previews, errors, and timings,
 - input / output / logs / a synthesized event feed,
 - **Resume now**, **Retry**, **Cancel**, and **Delete state** actions.
+
+**Saga compensation** (`bullmq-durable` ≥ 0.1.3) is first-class: the `compensating`
+and `compensation_failed` statuses appear in the Overview summary, status filter,
+and counts. A `compensation_failed` instance shows a "manual intervention needed"
+banner with its compensation report (what rolled back vs. failed) and a **Retry
+compensation** action that re-runs only the failed compensation steps.
 
 The **Health** page surfaces stuck instances in four classes: `running_stale`,
 `resume_missed`, `orphan_resume_job`, and `orphan_instance`.
@@ -182,7 +231,7 @@ GET  /api/alerts/channels                POST /api/alerts/channels
 POST /api/alerts/channels/:id/{remove,test}
 GET  /api/durable/instances              GET /api/durable/instances/:id
 GET  /api/durable/instances/:id/{steps,events,logs}
-POST /api/durable/instances/:id/{resume,retry,cancel,delete}
+POST /api/durable/instances/:id/{resume,retry,retry-compensation,cancel,delete}
 GET  /api/health                         GET /api/health/{redis,stuck}
 ```
 

@@ -17,6 +17,9 @@ export const DURABLE_PROCESSOR_METADATA = Symbol("DURABLE_PROCESSOR")
 /** Metadata key set by `@DurableProcess()` on a method. */
 export const DURABLE_PROCESS_METADATA = Symbol("DURABLE_PROCESS")
 
+/** Metadata key set by `@DurableFailure()` on a method. */
+export const DURABLE_FAILURE_METADATA = Symbol("DURABLE_FAILURE")
+
 /** Provider token for an injectable {@link DurableQueue}. */
 export function getDurableQueueToken(name: string): string {
   return `BULLMQ_DURABLE_QUEUE:${name}`

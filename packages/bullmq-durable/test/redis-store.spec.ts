@@ -98,6 +98,38 @@ describeRedis("RedisStateStore (integration)", () => {
     expect((await store.getInstance(id))?.status).toBe("cancelled")
   })
 
+  it("compensating → compensation_failed: persists fields and moves the index bucket", async () => {
+    const id = newId()
+    await init(id)
+
+    // Entering the compensating phase keeps the instance in the active set and
+    // persists the triggering error / failed step.
+    await store.updateInstance(id, {
+      status: "compensating",
+      failureError: { name: "Error", message: "boom" },
+      failedStep: "poll",
+      compensation: {
+        rolledBack: ["reserve"],
+        failed: [
+          { key: "charge", status: "failed", error: { name: "Error", message: "refund down" } },
+        ],
+      },
+    })
+    expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(1)
+
+    await store.compensationFailedInstance(id, new Error("boom"))
+    const inst = await store.getInstance(id)
+    expect(inst?.status).toBe("compensation_failed")
+    expect(inst?.failureError?.message).toBe("boom")
+    expect(inst?.failedStep).toBe("poll")
+    expect(inst?.compensation?.rolledBack).toEqual(["reserve"])
+    expect(inst?.compensation?.failed[0]?.key).toBe("charge")
+
+    // Terminal: out of the active set, into its own done bucket.
+    expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(0)
+    expect(await admin.zscore(`${prefix}:idx:done:compensation_failed`, id)).not.toBeNull()
+  })
+
   it("does not conjure a 'zombie' instance when updating a missing one", async () => {
     const id = newId()
     // Updating/cancelling before the instance exists must be a no-op (matching

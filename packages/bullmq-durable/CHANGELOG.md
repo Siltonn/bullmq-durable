@@ -5,6 +5,64 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-06-29
+
+### Added
+
+- **Saga compensation.** A completed step can register a compensation through the
+  new `onRollback` step option — `ctx.step(key, { onRollback }, fn)`. When an
+  instance reaches a terminal failure, compensations run for the steps that
+  actually completed, in reverse order, as durable, retried steps of their own (so
+  they survive resumes and must be idempotent — use `ctx.stepId(key)` as a
+  business idempotency key). `onRollback` is either a `RollbackFn<T>` —
+  `({ output, error }) => …`, where `output` is the step's checkpoint snapshot — or
+  `{ handler, retry }` to give the compensation its own retry policy. Bare
+  functions use the worker-level `defaultRollbackRetry` (defaults to
+  `{ attempts: 5, backoff: "exponential", delay: "1s", maxDelay: "30s" }`).
+- **Terminal-failure handler.** A worker-level `onFailure`, or a per-job
+  `{ run, onFailure }` handler, runs once — _after_ compensation — for genuine
+  failures only (control-flow signals like yield / `retryLater` / cancel never
+  reach it). It receives `(job, ctx, failure)` where `failure` is a
+  `DurableFailureInfo` (`{ error, failedStep?, completed, compensation }`); its own
+  `ctx.step` calls are durable and idempotent.
+- Two new terminal instance statuses: `compensating` (rollbacks in progress) and
+  `compensation_failed` (a compensation could not be completed and needs human
+  intervention). `RetentionOptions.compensationFailed` gives the latter its own TTL
+  (defaults to `"30d"`, kept longer than `failed`). A `CompensationReport`
+  (`{ rolledBack, failed }`) is persisted on the instance and surfaced to
+  `onFailure` and the dashboard.
+- NestJS: `@DurableFailure(jobName)` marks a method on a `@DurableProcessor` as the
+  terminal-failure handler for the sibling `@DurableProcess`; `forRootAsync` and
+  `registerQueueAsync` source `connection` (and other options) from DI (e.g. a
+  `ConfigService`); a queue's `processor` class(es) can be listed on
+  `registerQueue({ processor })` so they are auto-registered and exported (no
+  separate `providers` entry to forget); `defaultRollbackRetry` is configurable at
+  the root and per queue.
+- `isDurableControlSignal(error)` — a type guard covering every durable
+  control-flow signal (yield / retry-later / cancel), so a `catch` can re-throw
+  them without enumerating each variant (forgetting `DurableCancelledError` is an
+  easy way to make a cancelled job run its failure settlement).
+
+### Changed
+
+- **Queues and workers are now payload-typed, mirroring BullMQ** — there is no
+  longer a name→payload job map to declare. `DurableQueue<Data, Result>` types the
+  payload, the job name passed to `queue.add(name, data)` is a free routing label,
+  and each worker handler types its own payload through its `DurableJob<Data,
+  Result>` parameter. **Breaking:** the job-map generics and the `DurableJobMap` /
+  `DurableJobSpec` / `JobData` / `JobResult` types are removed. Migrate
+  `new DurableQueue<{ video: { data: In; result: Out } }>(…)` to
+  `new DurableQueue<In, Out>(…)`, and annotate handler `job` parameters explicitly.
+
+### Fixed
+
+- A terminally-failed step now replays its stored error without re-running its body
+  — symmetric with a completed step replaying its result — so its side effect can't
+  re-fire on every compensation/resume tick. Jobs with no compensation and no
+  `onFailure` still fail straight to `failed` exactly as in 0.1.x (no `compensating`
+  phase, no extra metadata written), and a cancelled instance runs neither
+  compensation nor `onFailure`.
+
 ## [0.1.2] - 2026-06-28
 
 ### Added

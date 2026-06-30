@@ -34,7 +34,7 @@
  */
 
 import { FlowProducer, Queue, Worker } from "bullmq"
-import { DurableQueue, DurableWorker } from "bullmq-durable"
+import { DurableQueue, DurableWorker, type DurableJob } from "bullmq-durable"
 import { Redis } from "ioredis"
 
 const url = new URL(process.env.REDIS_URL ?? "redis://127.0.0.1:6379")
@@ -106,13 +106,12 @@ interface VideoJob {
   userId: string
   prompt: string
 }
-type GenerationJobs = { video: { data: VideoJob; result: unknown } }
 
 async function seedGeneration(redis: Redis): Promise<void> {
-  const queue = new DurableQueue<GenerationJobs>("generation", { connection })
-  const worker = new DurableWorker<GenerationJobs>(
+  const queue = new DurableQueue<VideoJob>("generation", { connection })
+  const worker = new DurableWorker(
     "generation",
-    async (job, ctx) => {
+    async (job: DurableJob<VideoJob>, ctx) => {
       await ctx.log(`Starting generation for ${job.data.id}`, { mode: job.data.mode })
       const task = await ctx.step("create-provider-task", async () => ({
         taskId: `task_${job.data.id}`,
@@ -207,13 +206,12 @@ interface ExportJob {
   id: string
   mode: "complete" | "sleep"
 }
-type ExportJobs = { report: { data: ExportJob; result: unknown } }
 
 async function seedExports(): Promise<void> {
-  const queue = new DurableQueue<ExportJobs>("exports", { connection })
-  const worker = new DurableWorker<ExportJobs>(
+  const queue = new DurableQueue<ExportJob>("exports", { connection })
+  const worker = new DurableWorker(
     "exports",
-    async (job, ctx) => {
+    async (job: DurableJob<ExportJob>, ctx) => {
       await ctx.step("gather-rows", async () => ({ rows: 48213 }))
       if (job.data.mode === "sleep") await ctx.sleep("await-upload", "8m")
       return ctx.step("upload", async () => ({
@@ -557,7 +555,6 @@ interface MediaJob {
   id: string
   mode: "complete" | "fail" | "sleep"
 }
-type MediaJobs = { encode: { data: MediaJob; result: unknown } }
 
 /**
  * A long durable pipeline (6 steps) with rich step results + logs. Produces a
@@ -566,10 +563,10 @@ type MediaJobs = { encode: { data: MediaJob; result: unknown } }
  * `retrying` instance and a `resume_missed` one.
  */
 async function seedMediaPipeline(redis: Redis): Promise<void> {
-  const queue = new DurableQueue<MediaJobs>("media", { connection })
-  const worker = new DurableWorker<MediaJobs>(
+  const queue = new DurableQueue<MediaJob>("media", { connection })
+  const worker = new DurableWorker(
     "media",
-    async (job, ctx) => {
+    async (job: DurableJob<MediaJob>, ctx) => {
       await ctx.log(`Encode request for ${job.data.id}`, { mode: job.data.mode })
       const probe = await ctx.step("probe-source", async () => ({
         container: "mov",

@@ -6,11 +6,12 @@
  */
 
 export { DurableBullModule } from "./module"
-export { DurableProcess, DurableProcessor } from "./decorators"
+export { DurableFailure, DurableProcess, DurableProcessor } from "./decorators"
 export { getDurableQueueToken, InjectDurableQueue } from "./injector"
 export { DurableExplorer } from "./explorer"
 export {
   DURABLE_BULL_OPTIONS,
+  DURABLE_FAILURE_METADATA,
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,
   DURABLE_STATE_STORE,
@@ -18,9 +19,13 @@ export {
   getDurableQueueOptionsToken,
 } from "./tokens"
 export type {
+  DurableBullRootAsyncOptions,
   DurableBullRootOptions,
+  DurableFailureMetadata,
+  DurableInjectionToken,
   DurableProcessMetadata,
   DurableProcessorMetadata,
+  DurableQueueAsyncRegistration,
   DurableQueueRegistration,
   DurableWorkerFactory,
   DurableWorkerHandle,
@@ -28,4 +33,9 @@ export type {
 
 // Re-export the core symbols most NestJS apps need in processor signatures.
 export { DurableQueue } from "../queue"
-export type { DurableContext, DurableJob, DurableJobMap } from "../types"
+export type {
+  DurableContext,
+  DurableFailureHandler,
+  DurableFailureInfo,
+  DurableJob,
+} from "../types"

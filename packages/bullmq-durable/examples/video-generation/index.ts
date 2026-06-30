@@ -7,7 +7,7 @@
  * from the last completed step instead of re-charging the provider.
  */
 
-import { DurableQueue, DurableWorker } from "bullmq-durable"
+import { DurableQueue, DurableWorker, type DurableJob } from "bullmq-durable"
 
 interface CreateVideoInput {
   userId: string
@@ -18,18 +18,14 @@ interface VideoAsset {
   url: string
 }
 
-type GenerationJobs = {
-  video: { data: CreateVideoInput; result: VideoAsset }
-}
-
 const connection = { host: "127.0.0.1", port: 6379 }
 
-export const queue = new DurableQueue<GenerationJobs>("generation", { connection })
+export const queue = new DurableQueue<CreateVideoInput, VideoAsset>("generation", { connection })
 
-export const worker = new DurableWorker<GenerationJobs>(
+export const worker = new DurableWorker(
   "generation",
   {
-    video: async (job, ctx) => {
+    video: async (job: DurableJob<CreateVideoInput, VideoAsset>, ctx) => {
       const task = await ctx.step("create-provider-task", () => provider.createVideo(job.data))
 
       await ctx.sleep("initial-wait", "10s")

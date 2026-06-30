@@ -60,7 +60,7 @@ function iconAnim(status: DurableStepStatus): string {
   return ""
 }
 
-/** TYPE-tag tints — calm by default, coloured only for retry/error. */
+/** TYPE-tag tints — calm by default, coloured only for retry/error/compensation. */
 const PREFIX: Record<string, string> = {
   TASK: "bg-secondary/10 text-secondary",
   STEP: "bg-default-100 text-foreground-500",
@@ -68,6 +68,8 @@ const PREFIX: Record<string, string> = {
   LOG: "bg-default-100 text-foreground-400",
   RETRY: "bg-warning/10 text-warning",
   ERROR: "bg-danger/10 text-danger",
+  ROLLBACK: "bg-warning/10 text-warning",
+  SETTLE: "bg-default-100 text-foreground-500",
 }
 
 /** Bar fill per step status — restrained, with the in-flight step in accent blue. */
@@ -84,8 +86,10 @@ const ROOT_BAR: Record<DurableDerivedStatus, string> = {
   sleeping: "bg-warning/50",
   retrying: "bg-warning/60",
   waiting: "bg-default-400/50",
+  compensating: "bg-warning/60",
   completed: "bg-success/60",
   failed: "bg-danger/70",
+  compensation_failed: "bg-danger/80",
   cancelled: "bg-default-400/45",
 }
 
@@ -403,10 +407,19 @@ function RowContent({
       : step.status === "completed" || step.status === "failed"
         ? formatDuration(step.durationMs)
         : undefined
+  // Tag compensation/failure-phase steps distinctly from the forward run.
+  const tag =
+    step.phase === "compensation"
+      ? "ROLLBACK"
+      : step.phase === "failure"
+        ? "SETTLE"
+        : step.type === "sleep"
+          ? "SLEEP"
+          : "STEP"
   return (
     <>
       {chevron}
-      <TypeTag kind={step.type === "sleep" ? "SLEEP" : "STEP"} />
+      <TypeTag kind={tag} />
       <CockpitIcon
         name={meta.icon}
         width={16}

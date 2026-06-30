@@ -5,8 +5,16 @@
  */
 
 import { SetMetadata } from "@nestjs/common"
-import { DURABLE_PROCESS_METADATA, DURABLE_PROCESSOR_METADATA } from "./tokens"
-import type { DurableProcessMetadata, DurableProcessorMetadata } from "./types"
+import {
+  DURABLE_FAILURE_METADATA,
+  DURABLE_PROCESS_METADATA,
+  DURABLE_PROCESSOR_METADATA,
+} from "./tokens"
+import type {
+  DurableFailureMetadata,
+  DurableProcessMetadata,
+  DurableProcessorMetadata,
+} from "./types"
 
 /**
  * Mark a provider class as the durable processor for `queueName`. Methods
@@ -21,4 +29,14 @@ export function DurableProcessor(queueName: string): ClassDecorator {
 /** Mark a method as the handler for `jobName` within a `@DurableProcessor`. */
 export function DurableProcess(jobName: string): MethodDecorator {
   return SetMetadata(DURABLE_PROCESS_METADATA, { jobName } satisfies DurableProcessMetadata)
+}
+
+/**
+ * Mark a method as the terminal-failure handler for `jobName` within a
+ * `@DurableProcessor`. It runs (after per-step compensation) only for genuine
+ * failures — control-flow signals never reach it — and receives
+ * `(job, ctx, failure)`.
+ */
+export function DurableFailure(jobName: string): MethodDecorator {
+  return SetMetadata(DURABLE_FAILURE_METADATA, { jobName } satisfies DurableFailureMetadata)
 }

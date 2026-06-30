@@ -11,6 +11,7 @@ import {
   DURABLE_WORKER_FACTORY,
   DurableBullModule,
   DurableExplorer,
+  DurableFailure,
   DurableProcess,
   DurableProcessor,
   DurableQueue,
@@ -43,6 +44,12 @@ class GenerationProcessor {
     return "image"
   }
 
+  // A sibling @DurableFailure is wired as the job's onFailure settlement.
+  @DurableFailure("video")
+  async onVideoFailure(): Promise<void> {
+    this.calls.push("video-failure")
+  }
+
   // A method without the decorator must be ignored by discovery.
   async helper(): Promise<void> {}
 }
@@ -66,6 +73,18 @@ class MediaProcessor extends BaseMediaProcessor {
   async thumbnail(): Promise<string> {
     return "thumbnail"
   }
+}
+
+// A processor whose @DurableFailure job name has no matching @DurableProcess.
+@DurableProcessor("orphan")
+class OrphanFailureProcessor {
+  @DurableProcess("real")
+  async real(): Promise<string> {
+    return "real"
+  }
+
+  @DurableFailure("typo") // no @DurableProcess("typo") — a developer typo
+  async onTypoFailure(): Promise<void> {}
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +153,39 @@ describe("DurableExplorer", () => {
     expect(created[0]?.options.retention).toEqual({ completed: "7d" })
     expect(created[0]?.options.connection).toBe(CONNECTION)
 
-    // Handlers are bound to the instance.
-    await (created[0]!.processor.video as () => Promise<string>)()
+    // Handlers are bound to the instance, wrapped as `{ run, onFailure? }`.
+    const videoHandler = created[0]!.processor.video as {
+      run: () => Promise<string>
+      onFailure?: () => Promise<void>
+    }
+    await videoHandler.run()
     expect(instance.calls).toContain("video")
 
+    // The sibling @DurableFailure is wired as the job's onFailure handler.
+    expect(typeof videoHandler.onFailure).toBe("function")
+    await videoHandler.onFailure!()
+    expect(instance.calls).toContain("video-failure")
+    // A job without @DurableFailure has no onFailure.
+    expect((created[0]!.processor.image as { onFailure?: unknown }).onFailure).toBeUndefined()
+
     await explorer.onModuleDestroy()
+  })
+
+  it("throws when a @DurableFailure has no matching @DurableProcess", () => {
+    const instance = new OrphanFailureProcessor()
+    const factory: DurableWorkerFactory = () => ({ close: async () => undefined })
+    const discovery = { getProviders: () => [{ instance }] }
+    const moduleRef = {
+      get: (token: unknown) =>
+        token === DURABLE_BULL_OPTIONS ? { connection: CONNECTION } : undefined,
+    }
+    const explorer = new DurableExplorer(
+      discovery as never,
+      new Reflector(),
+      moduleRef as never,
+      factory,
+    )
+    expect(() => explorer.onModuleInit()).toThrow(/no matching\s+@DurableProcess/)
   })
 
   it("discovers @DurableProcess methods inherited from a base class", () => {
@@ -266,6 +313,85 @@ describe("DurableBullModule", () => {
     const media = moduleRef.get<DurableQueue>(getDurableQueueToken("media"), { strict: false })
     expect(gen.stateStore).toBe(store)
     expect(media.stateStore).toBe(store)
+
+    await moduleRef.close()
+  })
+
+  it("forRootAsync resolves the root options from a factory", async () => {
+    const store = new MemoryStateStore()
+    const started: string[] = []
+    const factory: DurableWorkerFactory = (queueName) => {
+      started.push(queueName)
+      return { close: async () => undefined }
+    }
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableBullModule.forRootAsync({
+          useFactory: () => ({ connection: CONNECTION, stateStore: store }),
+        }),
+        DurableBullModule.registerQueue({ name: "generation" }),
+      ],
+      providers: [{ provide: DURABLE_WORKER_FACTORY, useValue: factory }, GenerationProcessor],
+    }).compile()
+    await moduleRef.init()
+
+    const opts = moduleRef.get<{ stateStore?: unknown }>(DURABLE_BULL_OPTIONS, { strict: false })
+    expect(opts.stateStore).toBe(store)
+    expect(started).toContain("generation")
+
+    const queue = moduleRef.get<DurableQueue>(getDurableQueueToken("generation"), { strict: false })
+    expect(queue.stateStore).toBe(store)
+
+    await moduleRef.close()
+  })
+
+  it("registerQueueAsync resolves per-queue options from a factory", async () => {
+    const store = new MemoryStateStore()
+    const workerOptions: Array<{ concurrency?: number }> = []
+    const factory: DurableWorkerFactory = (_queueName, _processor, options) => {
+      workerOptions.push(options)
+      return { close: async () => undefined }
+    }
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableBullModule.forRoot({ connection: CONNECTION, stateStore: store }),
+        DurableBullModule.registerQueueAsync({
+          name: "generation",
+          useFactory: () => ({ concurrency: 7 }),
+        }),
+      ],
+      providers: [{ provide: DURABLE_WORKER_FACTORY, useValue: factory }, GenerationProcessor],
+    }).compile()
+    await moduleRef.init()
+
+    expect(workerOptions[0]?.concurrency).toBe(7)
+    const queue = moduleRef.get<DurableQueue>(getDurableQueueToken("generation"), { strict: false })
+    expect(queue).toBeInstanceOf(DurableQueue)
+
+    await moduleRef.close()
+  })
+
+  it("registerQueue({ processor }) auto-registers the processor without a providers entry", async () => {
+    const store = new MemoryStateStore()
+    const started: string[] = []
+    const factory: DurableWorkerFactory = (queueName) => {
+      started.push(queueName)
+      return { close: async () => undefined }
+    }
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableBullModule.forRoot({ connection: CONNECTION, stateStore: store }),
+        // GenerationProcessor is declared only via `processor`, not in `providers`.
+        DurableBullModule.registerQueue({ name: "generation", processor: GenerationProcessor }),
+      ],
+      providers: [{ provide: DURABLE_WORKER_FACTORY, useValue: factory }],
+    }).compile()
+    await moduleRef.init()
+
+    expect(started).toContain("generation")
 
     await moduleRef.close()
   })

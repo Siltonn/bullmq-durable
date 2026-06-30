@@ -10,6 +10,8 @@
 import {
   createInstanceId,
   DurableRuntime,
+  type DurableFailureHandler,
+  type DurableJobHandler,
   type DurableProcessor,
   type DurableProcessorInput,
   type DurableProcessorHandlers,
@@ -17,6 +19,7 @@ import {
   MemoryStateStore,
   type ResumeScheduler,
   type RetentionOptions,
+  type RetryOptions,
   type RunOutcome,
   type ScheduleResumeInput,
   type StateStore,
@@ -28,6 +31,9 @@ export interface TestEngineOptions {
   store?: StateStore
   queueName?: string
   defaultStepOptions?: StepOptions
+  defaultRollbackRetry?: RetryOptions
+  /** A worker-level default terminal-failure handler. */
+  onFailure?: DurableFailureHandler
   retention?: RetentionOptions
   lockTimeout?: string | number
   maxLogs?: number
@@ -67,7 +73,7 @@ export class TestEngine {
   }
 
   constructor(
-    private readonly processor: DurableProcessorInput<any>,
+    private readonly processor: DurableProcessorInput,
     private readonly options: TestEngineOptions = {},
   ) {
     this.store = options.store ?? new MemoryStateStore()
@@ -182,6 +188,8 @@ export class TestEngine {
       store: this.store,
       scheduler: this.scheduler,
       defaultStepOptions: this.options.defaultStepOptions,
+      defaultRollbackRetry: this.options.defaultRollbackRetry,
+      onFailure: this.resolveOnFailure(params.jobName) ?? this.options.onFailure,
       retention: this.options.retention,
       lockTimeoutMs: parseDuration(this.options.lockTimeout ?? "5m"),
       maxLogs: this.options.maxLogs ?? 1000,
@@ -192,9 +200,18 @@ export class TestEngine {
     if (typeof this.processor === "function") {
       return this.processor as DurableProcessor
     }
-    const handlers = this.processor as DurableProcessorHandlers<any>
+    const handlers = this.processor as DurableProcessorHandlers
     const handler = handlers[jobName]
     if (!handler) throw new Error(`No processor for job "${jobName}"`)
-    return handler as DurableProcessor
+    if (typeof handler === "function") return handler as DurableProcessor
+    return (handler as DurableJobHandler).run as DurableProcessor
+  }
+
+  /** Per-job `onFailure` from a `{ run, onFailure }` handler entry, if present. */
+  private resolveOnFailure(jobName: string): DurableFailureHandler | undefined {
+    if (typeof this.processor === "function") return undefined
+    const handler = (this.processor as DurableProcessorHandlers)[jobName]
+    if (!handler || typeof handler === "function") return undefined
+    return (handler as DurableJobHandler).onFailure
   }
 }

@@ -42,8 +42,10 @@ export const durableStatusSchema = z.enum([
   "sleeping",
   "retrying",
   "waiting",
+  "compensating",
   "completed",
   "failed",
+  "compensation_failed",
   "cancelled",
   "all",
 ])

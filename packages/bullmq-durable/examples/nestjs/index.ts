@@ -26,14 +26,12 @@ interface VideoResult {
   assetId: string
 }
 
-type GenerationJobs = {
-  video: { data: CreateVideoInput; result: VideoResult }
-}
-
 const connection = { host: "127.0.0.1", port: 6379 }
 
 @DurableProcessor("generation")
 export class GenerationProcessor {
+  // "video" is a free routing label; the handler types its own payload — there
+  // is no name->payload map to declare.
   @DurableProcess("video")
   async run(
     job: DurableJob<CreateVideoInput, VideoResult>,
@@ -48,8 +46,9 @@ export class GenerationProcessor {
 @Injectable()
 export class GenerationService {
   constructor(
+    // The queue is payload-typed, exactly like a BullMQ `Queue<Data, Result>`.
     @InjectDurableQueue("generation")
-    private readonly queue: DurableQueue<GenerationJobs>,
+    private readonly queue: DurableQueue<CreateVideoInput, VideoResult>,
   ) {}
 
   async createVideo(input: CreateVideoInput) {
@@ -59,13 +58,16 @@ export class GenerationService {
 
 @Module({
   imports: [
+    // `forRootAsync` is also available to source `connection` from a ConfigService.
     DurableBullModule.forRoot({ connection }),
     DurableBullModule.registerQueue({
       name: "generation",
       retention: { completed: "7d", failed: "30d" },
+      // Listing the processor here auto-registers it — no separate `providers` entry.
+      processor: GenerationProcessor,
     }),
   ],
-  providers: [GenerationProcessor, GenerationService],
+  providers: [GenerationService],
 })
 export class GenerationModule {}
 

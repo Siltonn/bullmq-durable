@@ -67,10 +67,10 @@ export interface DurableInspectorDeps {
 }
 
 /** Statuses whose derived view depends on their steps. */
-const STEP_HUNGRY = new Set(["running", "yielded", "failed"])
+const STEP_HUNGRY = new Set(["running", "yielded", "compensating", "failed", "compensation_failed"])
 
 /** The terminal statuses, in their fixed index-bucket order. */
-const TERMINAL_STATUSES = ["completed", "failed", "cancelled"] as const
+const TERMINAL_STATUSES = ["completed", "failed", "compensation_failed", "cancelled"] as const
 
 /** Max ids loaded per terminal bucket when listing. Pagination beyond this
  *  window is reported as `truncated` — the list never falls back to a full scan. */
@@ -82,8 +82,10 @@ const EMPTY_COUNTS = {
   sleeping: 0,
   retrying: 0,
   waiting: 0,
+  compensating: 0,
   completed: 0,
   failed: 0,
+  compensation_failed: 0,
   cancelled: 0,
   stuck: 0,
   total: 0,
@@ -159,7 +161,11 @@ export class DurableInspector {
     windowed: boolean
   }> {
     const status = query.status
-    const isTerminal = status === "completed" || status === "failed" || status === "cancelled"
+    const isTerminal =
+      status === "completed" ||
+      status === "failed" ||
+      status === "compensation_failed" ||
+      status === "cancelled"
     let wantActive: boolean
     let buckets: readonly TerminalStatus[]
     if (query.stuckOnly) {
@@ -224,19 +230,20 @@ export class DurableInspector {
    * instance, so an empty index simply means no instances.
    */
   async statusCounts(): Promise<DurableStatusCounts> {
-    const [completed, failed, cancelled] = await this.terminalCounts()
+    const [completed, failed, compensationFailed, cancelled] = await this.terminalCounts()
     const active = await this.activeSummaries()
 
     const counts: DurableStatusCounts = {
       ...EMPTY_COUNTS,
       completed,
       failed,
+      compensation_failed: compensationFailed,
       cancelled,
-      total: active.length + completed + failed + cancelled,
+      total: active.length + completed + failed + compensationFailed + cancelled,
     }
     for (const s of active) {
       // The active set is non-terminal, so this only bumps
-      // running/sleeping/retrying/waiting (terminal counts came from ZCARD).
+      // running/sleeping/retrying/waiting/compensating (terminal counts came from ZCARD).
       counts[s.derivedStatus] += 1
       if (s.stuck) counts.stuck += 1
     }
@@ -284,7 +291,9 @@ export class DurableInspector {
    *  by score even if not yet physically pruned, so the count is exact WITHOUT the
    *  overview endpoint having to write (the runtime prunes on each terminal
    *  transition). */
-  private async terminalCounts(): Promise<[completed: number, failed: number, cancelled: number]> {
+  private async terminalCounts(): Promise<
+    [completed: number, failed: number, compensationFailed: number, cancelled: number]
+  > {
     const now = Date.now()
     const pipe = this.redis.pipeline()
     for (const status of TERMINAL_STATUSES) {
@@ -292,7 +301,8 @@ export class DurableInspector {
     }
     const res = await pipe.exec()
     const card = (i: number) => Number(res?.[i]?.[1] ?? 0)
-    return [card(0), card(1), card(2)]
+    // Order matches TERMINAL_STATUSES: completed, failed, compensation_failed, cancelled.
+    return [card(0), card(1), card(2), card(3)]
   }
 
   /** Hydrate + summarize the bounded active (non-terminal) set — no scan. Shared
@@ -308,8 +318,13 @@ export class DurableInspector {
     const live: StoredInstanceState[] = []
     const stale: string[] = []
     for (const i of instances) {
-      if (i.status === "running" || i.status === "yielded") live.push(i)
-      else stale.push(i.id)
+      // running / yielded / compensating are all non-terminal — the runtime keeps
+      // them in the active set, so they are genuinely active (not stale).
+      if (i.status === "running" || i.status === "yielded" || i.status === "compensating") {
+        live.push(i)
+      } else {
+        stale.push(i.id)
+      }
     }
     if (stale.length > 0) {
       void this.redis.srem(activeIndexKey(this.prefix), ...stale).catch(() => {})
@@ -388,6 +403,9 @@ export class DurableInspector {
     if (instance.status === "failed") {
       throw badRequest("Use retry to re-run a failed instance")
     }
+    if (instance.status === "compensation_failed") {
+      throw badRequest("Use retry compensation to re-drive a compensation_failed instance")
+    }
     await this.enqueueResume(instance, 0)
     await this.appendCockpitLog(instanceId, "Resume requested from cockpit", { action: "resume" })
   }
@@ -404,6 +422,49 @@ export class DurableInspector {
     await this.reactivate(instanceId)
     await this.enqueueResume(instance, 0)
     await this.appendCockpitLog(instanceId, "Retry requested from cockpit", { action: "retry" })
+  }
+
+  /**
+   * Re-drive a `compensation_failed` instance's compensation: reset the steps
+   * whose compensation/settlement permanently failed (so they re-run), put the
+   * instance back into the `compensating` phase, and enqueue a resume. Already
+   * succeeded compensations stay completed (cache hits), so only the failed ones
+   * are retried — safe because compensations are idempotent.
+   */
+  async retryCompensation(instanceId: string): Promise<void> {
+    const instance = await this.requireInstance(instanceId)
+    if (instance.status !== "compensation_failed") {
+      throw badRequest("Retry compensation only applies to compensation_failed instances")
+    }
+
+    // Find the failed internal (compensation/failure) steps to reset.
+    const stepsHash = await this.redis.hgetall(stepsKey(this.prefix, instanceId))
+    const failedInternal = Object.entries(stepsHash)
+      .filter(([, raw]) => {
+        const s = parseStep(raw)
+        return (
+          s !== null &&
+          (s.phase === "compensation" || s.phase === "failure") &&
+          s.status === "failed"
+        )
+      })
+      .map(([field]) => field)
+
+    const [inst, steps, logs] = this.instanceKeys(instanceId)
+    const m = this.redis.multi()
+    if (failedInternal.length > 0) m.hdel(stepsKey(this.prefix, instanceId), ...failedInternal)
+    // Back to compensating + the active set; drop the terminal error/report/TTL.
+    // `failureError` / `failedStep` are kept so the resumed sequence matches the original.
+    m.hdel(inst, "error", "failedAt", "compensation")
+    m.hset(inst, "status", "compensating", "updatedAt", String(Date.now()))
+    m.sadd(activeIndexKey(this.prefix), instanceId)
+    for (const st of TERMINAL_STATUSES) m.zrem(terminalIndexKey(this.prefix, st), instanceId)
+    await m.persist(inst).persist(steps).persist(logs).exec()
+
+    await this.enqueueResume(instance, 0)
+    await this.appendCockpitLog(instanceId, "Retry compensation requested from cockpit", {
+      action: "retry-compensation",
+    })
   }
 
   async cancel(instanceId: string): Promise<void> {
@@ -478,9 +539,17 @@ export class DurableInspector {
   /** Lift an instance back into the active set, clearing every terminal entry + TTL (retry). */
   private async reactivate(instanceId: string): Promise<void> {
     const [inst, steps, logs] = this.instanceKeys(instanceId)
-    const m = this.redis
-      .multi()
-      .hdel(inst, "error", "failedAt")
+    // The runtime now replay-throws a terminally-`failed` step instead of re-running
+    // it, so a retry that left the failed step in place would immediately re-fail with
+    // the cached error. Delete the failed step records here so they re-run on replay.
+    const stepsHash = await this.redis.hgetall(stepsKey(this.prefix, instanceId))
+    const failedSteps = Object.entries(stepsHash)
+      .filter(([, raw]) => parseStep(raw)?.status === "failed")
+      .map(([field]) => field)
+
+    const m = this.redis.multi()
+    if (failedSteps.length > 0) m.hdel(steps, ...failedSteps)
+    m.hdel(inst, "error", "failedAt", "failureError", "failedStep", "compensation")
       .hset(inst, "status", "running", "updatedAt", String(Date.now()))
       .sadd(activeIndexKey(this.prefix), instanceId)
     for (const st of TERMINAL_STATUSES) m.zrem(terminalIndexKey(this.prefix, st), instanceId)

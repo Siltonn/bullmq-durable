@@ -27,8 +27,13 @@
     "resolveJsonModule": true,
 
     "experimentalDecorators": true,
-    "emitDecoratorMetadata": true
+    "emitDecoratorMetadata": true,
+
+    "paths": {
+      "bullmq-cockpit": ["./src/index.ts"],
+      "bullmq-cockpit/nestjs": ["./src/adapters/nestjs.ts"]
+    }
   },
-  "include": ["src", "scripts"],
+  "include": ["src", "scripts", "examples"],
   "exclude": ["node_modules", "dist", "client"]
 }

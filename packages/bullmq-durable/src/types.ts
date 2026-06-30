@@ -41,10 +41,28 @@ export interface RetryOptions {
   maxDelay?: DurationInput
 }
 
+/**
+ * A per-step compensation handler. Runs (in reverse order) when the instance
+ * reaches a terminal failure, but only for steps that actually completed.
+ * `output` is the step's checkpoint snapshot (same JSON-roundtripped value the
+ * step returned); `error` is the error that triggered the terminal failure.
+ *
+ * Compensations MUST be idempotent — they run as durable, retried steps and may
+ * re-run across resumes. Use `ctx.stepId(key)` as a business idempotency key.
+ */
+export type RollbackFn<T> = (rb: { output: T; error: unknown }) => void | Promise<void>
+
 /** Options accepted by `ctx.step(key, options, fn)`. */
-export interface StepOptions {
+export interface StepOptions<T = unknown> {
   /** Retry policy for this step. */
   retry?: RetryOptions
+  /**
+   * Compensation for this step, run in reverse order on terminal failure (only
+   * if the step completed). A bare function uses the worker's
+   * `defaultRollbackRetry`; the object form configures the compensation's own
+   * retry policy.
+   */
+  onRollback?: RollbackFn<T> | { handler: RollbackFn<T>; retry?: RetryOptions }
 }
 
 // ---------------------------------------------------------------------------
@@ -55,10 +73,28 @@ export type StepStatus = "running" | "completed" | "failed" | "sleeping" | "skip
 
 export type StepType = "step" | "sleep"
 
+/**
+ * Which lifecycle phase a step belongs to. Orthogonal to {@link StepType}.
+ * `main` is the forward processor; `compensation` is a per-step `onRollback`
+ * (stored under the `__rollback__:` namespace); `failure` is a step run inside
+ * the `onFailure` handler (stored under `__failure__:`). Absent means `main`.
+ */
+export type StepPhase = "main" | "compensation" | "failure"
+
 /** Persisted state for a single step within an instance. */
 export interface StepState {
   key: string
   type: StepType
+  /** Lifecycle phase. Absent is treated as `"main"` (back-compat with 0.1.x). */
+  phase?: StepPhase
+  /**
+   * Monotonic per-instance sequence, allocated once at the step's first persist
+   * (reused on replay). It is the stable order key for compensation — rollbacks
+   * run in reverse `seq` order (reverse of execution-start), which stays
+   * deterministic across resumes even for steps started concurrently. Also gives
+   * cockpit a collision-free step timeline.
+   */
+  seq?: number
   status: StepStatus
   /** Cached return value once `status === "completed"`. */
   result?: unknown
@@ -77,7 +113,27 @@ export interface StepState {
 // Instance state machine
 // ---------------------------------------------------------------------------
 
-export type InstanceStatus = "running" | "yielded" | "completed" | "failed" | "cancelled"
+export type InstanceStatus =
+  | "running"
+  | "yielded"
+  | "compensating"
+  | "completed"
+  | "failed"
+  | "compensation_failed"
+  | "cancelled"
+
+/** A single compensation's outcome, surfaced to `onFailure` and to cockpit. */
+export interface CompensationOutcome {
+  key: string
+  status: "rolled-back" | "failed" | "skipped"
+  error?: SerializedError
+}
+
+/** Report of the compensation phase: what was rolled back, what failed. */
+export interface CompensationReport {
+  rolledBack: string[]
+  failed: CompensationOutcome[]
+}
 
 /** Persisted state for a durable instance — the real unit of execution. */
 export interface InstanceState {
@@ -90,10 +146,22 @@ export interface InstanceState {
   input: unknown
   output?: unknown
   error?: SerializedError
+  /**
+   * The error that triggered the `compensating` phase, persisted so a resumed
+   * compensation tick can rebuild `DurableFailureInfo.error` without re-deriving
+   * it from the failed step.
+   */
+  failureError?: SerializedError
+  /** The key of the step whose failure triggered the terminal sequence. */
+  failedStep?: string
+  /** Compensation report, written when the instance reaches a terminal state. */
+  compensation?: CompensationReport
   /** How many times the processor has been (re)entered for this instance. */
   runCount: number
   /** Monotonic counter used to give each resume job a unique id. */
   resumeSeq: number
+  /** Monotonic counter used to allocate per-step {@link StepState.seq}. */
+  stepSeq?: number
   createdAt: number
   updatedAt: number
   completedAt?: number
@@ -108,26 +176,8 @@ export interface DurableLog {
 }
 
 // ---------------------------------------------------------------------------
-// Job map typing
+// Job typing
 // ---------------------------------------------------------------------------
-
-/** Describes the input/output shape of one named job. */
-export interface DurableJobSpec {
-  data: unknown
-  result: unknown
-}
-
-/** A map of job name -> {@link DurableJobSpec}, used for end-to-end typing. */
-export type DurableJobMap = Record<string, DurableJobSpec>
-
-/** Extract the `data` type for job `TName` from a job map. */
-export type JobData<TJobs extends DurableJobMap, TName extends keyof TJobs> = TJobs[TName]["data"]
-
-/** Extract the `result` type for job `TName` from a job map. */
-export type JobResult<
-  TJobs extends DurableJobMap,
-  TName extends keyof TJobs,
-> = TJobs[TName]["result"]
 
 /**
  * A BullMQ {@link Job} augmented with its durable instance id. The `data`
@@ -168,7 +218,7 @@ export interface DurableContext {
    * step returns its cached result without re-running `fn`.
    */
   step<T>(key: string, fn: StepFn<T>): Promise<T>
-  step<T>(key: string, options: StepOptions, fn: StepFn<T>): Promise<T>
+  step<T>(key: string, options: StepOptions<T>, fn: StepFn<T>): Promise<T>
 
   /** Pause the instance for `duration` without occupying a worker. */
   sleep(key: string, duration: DurationInput): Promise<void>
@@ -200,18 +250,62 @@ export type DurableProcessor<TData = unknown, TResult = unknown, TName extends s
   ctx: DurableContext,
 ) => Promise<TResult> | TResult
 
-/** A map of job name -> processor, for multi-job workers. */
-export type DurableProcessorHandlers<TJobs extends DurableJobMap> = {
-  [K in keyof TJobs & string]: DurableProcessor<JobData<TJobs, K>, JobResult<TJobs, K>, K>
+/**
+ * Structured information handed to an `onFailure` handler when an instance
+ * reaches a terminal failure. Lets settlement branch on *what* happened without
+ * hand-maintaining flags.
+ */
+export interface DurableFailureInfo {
+  /** The error that triggered the terminal failure. */
+  error: unknown
+  /** The key of the step whose failure triggered it (if a step threw). */
+  failedStep?: string
+  /** Keys of the `main`-phase steps that completed (replaces `reserved`-style flags). */
+  completed: ReadonlySet<string>
+  /** Outcome of the compensation phase that ran before this handler. */
+  compensation: CompensationReport
 }
+
+/**
+ * A terminal-failure handler. Runs once, AFTER per-step compensation, only for
+ * genuine failures — control-flow signals (yield / retryLater / cancel) never
+ * reach it. Its own `ctx.step` calls are durable and idempotent.
+ */
+export type DurableFailureHandler<TData = unknown, TResult = unknown> = (
+  job: DurableJob<TData, TResult>,
+  ctx: DurableContext,
+  failure: DurableFailureInfo,
+) => Promise<void> | void
+
+/**
+ * A per-job handler: either a bare processor function, or an object pairing the
+ * forward processor with a sibling `onFailure` settlement handler.
+ */
+export interface DurableJobHandler<
+  TData = unknown,
+  TResult = unknown,
+  TName extends string = string,
+> {
+  run: DurableProcessor<TData, TResult, TName>
+  onFailure?: DurableFailureHandler<TData, TResult>
+}
+
+/**
+ * A map of job name -> processor (or `{ run, onFailure }`), for multi-job
+ * workers. The job name is a free routing label (BullMQ-style); each handler
+ * types its own payload through its `DurableJob<Data, Result>` parameter, so
+ * there is no central name->payload map to declare.
+ */
+export type DurableProcessorHandlers = Record<
+  string,
+  DurableProcessor<any, any, string> | DurableJobHandler<any, any, string>
+>
 
 /**
  * The processor argument accepted by `DurableWorker`: either a single function
  * that handles every job name, or a per-name handler map.
  */
-export type DurableProcessorInput<TJobs extends DurableJobMap> =
-  | DurableProcessor<any, any, string>
-  | DurableProcessorHandlers<TJobs>
+export type DurableProcessorInput = DurableProcessor<any, any, string> | DurableProcessorHandlers
 
 // ---------------------------------------------------------------------------
 // Options
@@ -230,6 +324,12 @@ export interface RetentionOptions {
   completed?: DurationInput
   /** TTL applied once an instance fails. @defaultValue `"7d"` */
   failed?: DurationInput
+  /**
+   * TTL applied once an instance fails WITH a compensation that could not be
+   * completed (`compensation_failed`). Kept longer than `failed` because it
+   * needs human intervention. @defaultValue `"30d"`
+   */
+  compensationFailed?: DurationInput
   /** TTL applied once an instance is cancelled. @defaultValue `"24h"` */
   cancelled?: DurationInput
 }
@@ -242,6 +342,7 @@ export interface RetentionOptions {
 export const DEFAULT_RETENTION: Required<RetentionOptions> = {
   completed: "24h",
   failed: "7d",
+  compensationFailed: "30d",
   cancelled: "24h",
 }
 
@@ -282,6 +383,17 @@ export interface DurableWorkerOptions {
   retention?: RetentionOptions
   /** Default step options merged into every `ctx.step` call. */
   defaultStepOptions?: StepOptions
+  /**
+   * Default retry policy for `onRollback` compensations that don't set their
+   * own. Compensations should be tried hard before giving up. Defaults to
+   * `{ attempts: 5, backoff: "exponential", delay: "1s", maxDelay: "30s" }`.
+   */
+  defaultRollbackRetry?: RetryOptions
+  /**
+   * A global terminal-failure handler applied to every job that doesn't supply
+   * its own (via a `{ run, onFailure }` handler). Runs after compensation.
+   */
+  onFailure?: DurableFailureHandler
   /** Maximum number of log entries kept per instance. Defaults to `1000`. */
   maxLogs?: number
   /**

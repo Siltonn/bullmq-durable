@@ -82,10 +82,17 @@ export interface BullMQCockpitOptions {
   /** A BullMQ-compatible Redis connection (ioredis options or an instance). */
   connection: ConnectionOptions
   /**
-   * Queue names to expose. When omitted, the cockpit auto-discovers queues from
-   * Redis (by scanning BullMQ's `*:meta` keys).
+   * Queue names to expose. When omitted, the cockpit auto-discovers queues once
+   * at startup by scanning BullMQ's `*:meta` keys, then caches that set for the
+   * process lifetime (queues created later need a restart to appear). Pass this
+   * list in production to skip the scan entirely.
+   *
+   * A **function** may be supplied instead of an array: it is called on each
+   * request to resolve the current allow-list, and (being present) disables
+   * auto-discovery. This is how the NestJS module accumulates queues registered
+   * by `registerQueue` across feature modules.
    */
-  queues?: string[]
+  queues?: string[] | (() => string[])
   /** BullMQ's key prefix (the `bull` namespace). Defaults to `"bull"`. */
   bullPrefix?: string
   /**
@@ -133,8 +140,11 @@ export interface NormalizedAlertsOptions {
 
 export interface NormalizedCockpitOptions {
   connection: ConnectionOptions
-  /** Explicit queue allow-list, or `null` to auto-discover. */
-  queues: string[] | null
+  /**
+   * Explicit queue allow-list (or a function resolving one per request), or
+   * `null` to auto-discover.
+   */
+  queues: string[] | (() => string[]) | null
   bullPrefix: string
   cockpitPrefix: string
   basePath: string
@@ -169,7 +179,12 @@ export function normalizeOptions(options: BullMQCockpitOptions): NormalizedCockp
 
   return {
     connection: options.connection,
-    queues: options.queues && options.queues.length > 0 ? [...options.queues] : null,
+    queues:
+      typeof options.queues === "function"
+        ? options.queues
+        : options.queues && options.queues.length > 0
+          ? [...options.queues]
+          : null,
     bullPrefix: options.bullPrefix ?? "bull",
     cockpitPrefix: options.cockpitPrefix ?? "bullmq-cockpit",
     basePath: normalizeBasePath(options.basePath),

@@ -32,13 +32,14 @@ new DurableWorker(
 5. [`ctx.sleep`](#5-ctxsleep)
 6. [`ctx.retryLater`](#6-ctxretrylater)
 7. [Retry policy](#7-retry-policy)
-8. [Redis persistence ⚠️](#8-redis-persistence-)
-9. [NestJS integration](#9-nestjs-integration)
-10. [TypeScript job map](#10-typescript-job-map)
-11. [Production checklist](#11-production-checklist)
-12. [Limitations](#12-limitations)
-13. [Roadmap](#13-roadmap)
-14. [API reference](#14-api-reference)
+8. [Compensation & failure handling](#8-compensation--failure-handling)
+9. [Redis persistence ⚠️](#9-redis-persistence-)
+10. [NestJS integration](#10-nestjs-integration)
+11. [TypeScript typing](#11-typescript-typing)
+12. [Production checklist](#12-production-checklist)
+13. [Limitations](#13-limitations)
+14. [Roadmap](#14-roadmap)
+15. [API reference](#15-api-reference)
 
 ---
 
@@ -252,7 +253,81 @@ new DurableWorker("generation", processor, {
 Because retries are driven by delayed resume jobs, keep BullMQ's own `attempts`
 at `1` (the default) and let `ctx.step` own retries.
 
-## 8. Redis persistence ⚠️
+## 8. Compensation & failure handling
+
+Durable steps move money, provision resources, call providers. When a later step
+fails for good, the work the earlier steps already did has to be undone. Attach a
+**compensation** to a step with `onRollback` — it runs, in reverse order, for the
+steps that actually completed, when the instance reaches a terminal failure:
+
+```ts
+const worker = new DurableWorker(
+  "orders",
+  {
+    checkout: async (job: DurableJob<CheckoutInput, Receipt>, ctx) => {
+      const charge = await ctx.step(
+        "charge-card",
+        { onRollback: ({ output }) => payments.refund(output.chargeId) },
+        () => payments.charge(job.data.cardId, job.data.amount),
+      )
+
+      const seat = await ctx.step(
+        "reserve-seat",
+        { onRollback: ({ output }) => inventory.release(output.seatId) },
+        () => inventory.reserve(job.data.seatId),
+      )
+
+      // If this fails for good, `reserve-seat` rolls back, then `charge-card`.
+      return await ctx.step("confirm", () => fulfil(charge, seat))
+    },
+  },
+  { connection },
+)
+```
+
+- `onRollback` receives `{ output, error }` — `output` is the step's checkpoint
+  snapshot (the same value the step returned), `error` is what triggered the
+  failure.
+- Compensations run as **durable, retried steps of their own**, so they survive
+  resumes and must be **idempotent** (use `ctx.stepId(key)` as a business
+  idempotency key). A bare function uses the worker's `defaultRollbackRetry`
+  (`{ attempts: 5, backoff: "exponential", delay: "1s", maxDelay: "30s" }`); pass
+  `{ handler, retry }` to override it per step.
+- The instance moves through a `compensating` status while rollbacks run. If they
+  all succeed it lands `failed`; if one can't be completed it lands
+  `compensation_failed` (retained for 30 days by default — it needs a human).
+- A step with no `onRollback`, and a job with no compensation at all, behave
+  exactly as before: straight to `failed`, no compensation phase.
+
+### Settling a terminal failure
+
+To run final bookkeeping after compensation — mark the order failed, notify the
+user, emit a metric — give the job an `onFailure` handler (or set one worker-wide
+via `DurableWorkerOptions.onFailure`). Use the `{ run, onFailure }` handler form.
+It runs **once**, after compensation, for genuine failures only (`sleep` /
+`retryLater` / `cancel` never reach it), and its own `ctx.step` calls are durable
+too:
+
+```ts
+const worker = new DurableWorker(
+  "orders",
+  {
+    checkout: {
+      run: async (job: DurableJob<CheckoutInput, Receipt>, ctx) => {
+        /* … the steps above … */
+      },
+      // `failure`: { error, failedStep?, completed, compensation }
+      onFailure: async (job, ctx, failure) => {
+        await ctx.step("mark-failed", () => orders.markFailed(job.data.orderId))
+        await ctx.step("notify", () => email.send(job.data.userId, failure.error))
+      },
+    },
+  },
+  { connection },
+)
+```
+
+## 9. Redis persistence ⚠️
 
 > By default, bullmq-durable stores execution state in Redis using the provided
 > BullMQ connection. Durability depends on your Redis persistence, replication,
@@ -315,7 +390,7 @@ DurableBullModule.forRoot({ connection, stateStore: myStore })
 (A `registerQueue` that overrides `durablePrefix` to a different value keeps its
 own store, since one store maps to one key prefix.)
 
-## 9. NestJS integration
+## 10. NestJS integration
 
 A NestJS adapter ships behind the `bullmq-durable/nestjs` subpath. It mirrors
 `@nestjs/bullmq`'s ergonomics **without depending on it** — `@nestjs/common` and
@@ -332,12 +407,29 @@ import { DurableBullModule } from "bullmq-durable/nestjs"
     DurableBullModule.registerQueue({
       name: "generation",
       retention: { completed: "7d", failed: "30d" },
+      // List the processor here and it is auto-registered — no `providers` entry,
+      // so the explorer can never silently miss it.
+      processor: GenerationProcessor,
     }),
   ],
-  providers: [GenerationProcessor, GenerationService],
+  providers: [GenerationService],
 })
 export class GenerationModule {}
 ```
+
+Source `connection` from DI (e.g. a `ConfigService`) with the async forms —
+`forRootAsync({ inject, useFactory })` and `registerQueueAsync({ name, inject, useFactory })`:
+
+```ts
+DurableBullModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+})
+```
+
+The processor is typed like a BullMQ processor — the job name is a free routing
+label, and the handler types its own payload through `DurableJob<Data, Result>`:
 
 ```ts
 import { Injectable } from "@nestjs/common"
@@ -366,7 +458,9 @@ export class GenerationProcessor {
 @Injectable()
 export class GenerationService {
   constructor(
-    @InjectDurableQueue("generation") private readonly queue: DurableQueue<GenerationJobs>,
+    // Payload-typed, exactly like a BullMQ `Queue<Data, Result>`.
+    @InjectDurableQueue("generation")
+    private readonly queue: DurableQueue<CreateVideoInput, VideoResult>,
   ) {}
 
   createVideo(input: CreateVideoInput) {
@@ -379,33 +473,49 @@ export class GenerationService {
 worker for it automatically; queue-level options from `registerQueue` override
 the root defaults.
 
-See [`examples/nestjs`](./examples/nestjs).
-
-## 10. TypeScript job map
-
-Describe your jobs once and get end-to-end inference on `queue.add` and worker
-handlers:
+For [compensation & failure handling](#8-compensation--failure-handling), add
+`onRollback` to a `ctx.step` as usual, and declare the terminal-failure handler
+with `@DurableFailure(jobName)` on a sibling method of the same `@DurableProcessor`
+— it is wired to the matching `@DurableProcess` automatically:
 
 ```ts
-type GenerationJobs = {
-  video: { data: CreateVideoInput; result: VideoResult }
-  image: { data: CreateImageInput; result: ImageResult }
+@DurableProcessor("orders")
+export class CheckoutProcessor {
+  @DurableProcess("checkout")
+  async run(job: DurableJob<CheckoutInput, Receipt>, ctx: DurableContext) {
+    /* … steps with onRollback … */
+  }
+
+  @DurableFailure("checkout")
+  async onCheckoutFailed(
+    job: DurableJob<CheckoutInput, Receipt>,
+    ctx: DurableContext,
+    failure: DurableFailureInfo,
+  ) {
+    await ctx.step("mark-failed", () => orders.markFailed(job.data.orderId))
+  }
 }
-
-const queue = new DurableQueue<GenerationJobs>("generation", { connection })
-await queue.add("video", { userId: "u1", prompt: "hello" }) // ✅ data is type-checked
-
-new DurableWorker<GenerationJobs>(
-  "generation",
-  {
-    video: async (job, ctx) => ({ videoUrl: "..." }), // job.data: CreateVideoInput
-    image: async (job, ctx) => ({ imageUrl: "..." }),
-  },
-  { connection },
-)
 ```
 
-## 11. Production checklist
+See [`examples/nestjs`](./examples/nestjs).
+
+## 11. TypeScript typing
+
+Typing follows BullMQ: the queue is typed by its **payload**, and the job name is
+a free label you choose at `add` time — there is no name→payload map to declare.
+
+```ts
+const queue = new DurableQueue<CreateVideoInput, VideoResult>("generation", { connection })
+await queue.add("video", { userId: "u1", prompt: "hello" }) // ✅ data is type-checked
+
+new DurableWorker("generation", {
+  // Each handler types its own payload; the name is just a routing label.
+  video: async (job: DurableJob<CreateVideoInput, VideoResult>, ctx) => ({ videoUrl: "..." }),
+  image: async (job: DurableJob<CreateImageInput, ImageResult>, ctx) => ({ imageUrl: "..." }),
+}, { connection })
+```
+
+## 12. Production checklist
 
 - **Redis**: enable AOF, set `maxmemory-policy noeviction`, use replication +
   backups, and a dedicated database/prefix. Monitor memory, delayed jobs, and
@@ -435,7 +545,7 @@ new DurableWorker("generation", processor, {
 > `{ completed: "24h", failed: "7d", cancelled: "24h" }` so finished instances
 > never pile up unconfigured — set `retention` to tune or extend it.
 
-## 12. Limitations
+## 13. Limitations
 
 - Replay re-runs the processor from the top each tick; **completed steps are
   cache hits, but the surrounding code runs again** — keep non-step code cheap
@@ -445,18 +555,19 @@ new DurableWorker("generation", processor, {
 - Resume ticks appear as additional jobs in BullMQ's UI (the durable instance id
   stays stable across them).
 - Not yet implemented: `parallel`, `race`, child workflows, external
-  signals/events, cron workflows, and Saga compensation (see the roadmap).
+  signals/events, and cron workflows (see the roadmap).
 
-## 13. Roadmap
+## 14. Roadmap
 
 - `ctx.waitForEvent` + external `queue.sendEvent`
 - `ctx.parallel` / `ctx.race`
-- Step compensation (`compensate`) for Saga-style rollbacks
 
-> A read-only dashboard / inspection API has shipped — see
+> Saga compensation (`onRollback`) and terminal-failure settlement (`onFailure`)
+> have shipped — see [§8](#8-compensation--failure-handling). A read-only
+> dashboard / inspection API has shipped too — see
 > [`bullmq-cockpit`](../bullmq-cockpit).
 
-## 14. API reference
+## 15. API reference
 
 ### `new DurableQueue(name, options)`
 
@@ -474,14 +585,21 @@ and `.bull` (the underlying BullMQ queue).
 
 ### `new DurableWorker(name, processor, options)`
 
-`processor` is either a single `(job, ctx) => result` function or a
-`{ [jobName]: handler }` map. Options add `concurrency`, `lockTimeout`,
-`retention`, `defaultStepOptions`, `maxLogs`, `resumeAttempts`, `stateStore`,
+`processor` is either a single `(job, ctx) => result` function, or a
+`{ [jobName]: handler }` map where each handler is a processor function or a
+`{ run, onFailure }` object (see [§8](#8-compensation--failure-handling)). Options
+add `concurrency`, `lockTimeout`, `retention`, `defaultStepOptions`,
+`defaultRollbackRetry`, `onFailure`, `maxLogs`, `resumeAttempts`, `stateStore`,
 `durablePrefix`, and `bullWorkerOptions` on top of `connection`.
 
 `resumeAttempts` (default `3`) is the BullMQ `attempts` given to internally
 scheduled resume ticks, so a transient failure to enqueue the next resume is
 retried rather than stranding the instance.
+
+`defaultRollbackRetry` is the retry policy applied to bare `onRollback`
+compensations that don't set their own (default `{ attempts: 5, backoff:
+"exponential", delay: "1s", maxDelay: "30s" }`); `onFailure` is a worker-wide
+terminal-failure handler used for any job that doesn't supply its own.
 
 ### `ctx`
 
@@ -495,6 +613,9 @@ retried rather than stranding the instance.
 | `log(message, meta?)`                                | Append a structured log (mirrored to the BullMQ job). |
 | `stepId(key)`                                        | Deterministic id for a step (idempotency key).        |
 | `instanceId` / `runCount`                            | The instance id and current run count.                |
+
+Step options (`step(key, options, fn)`): `retry` (per-step retry policy) and
+`onRollback` (compensation — see [§8](#8-compensation--failure-handling)).
 
 ### Stores
 

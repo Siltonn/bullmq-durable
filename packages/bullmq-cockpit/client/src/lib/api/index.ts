@@ -235,6 +235,8 @@ export const api = {
   durableLogs: (id: string) => get<DurableLogEntry[]>(`/durable/instances/${enc(id)}/logs`),
   durableResume: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/resume`),
   durableRetry: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/retry`),
+  durableRetryCompensation: (id: string) =>
+    post<ActionResult>(`/durable/instances/${enc(id)}/retry-compensation`),
   durableCancel: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/cancel`),
   durableDelete: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/delete`),
 

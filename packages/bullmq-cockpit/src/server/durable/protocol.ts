@@ -37,7 +37,27 @@ export interface StoredSerializedError {
   code?: string | number
 }
 
-export type StoredInstanceStatus = "running" | "yielded" | "completed" | "failed" | "cancelled"
+export type StoredInstanceStatus =
+  | "running"
+  | "yielded"
+  | "compensating"
+  | "completed"
+  | "failed"
+  | "compensation_failed"
+  | "cancelled"
+
+export type StoredStepPhase = "main" | "compensation" | "failure"
+
+export interface StoredCompensationOutcome {
+  key: string
+  status: "rolled-back" | "failed" | "skipped"
+  error?: StoredSerializedError
+}
+
+export interface StoredCompensationReport {
+  rolledBack: string[]
+  failed: StoredCompensationOutcome[]
+}
 
 export interface StoredInstanceState {
   id: string
@@ -48,8 +68,15 @@ export interface StoredInstanceState {
   input?: unknown
   output?: unknown
   error?: StoredSerializedError
+  /** The error that triggered the compensating phase. */
+  failureError?: StoredSerializedError
+  /** The step whose failure triggered the terminal sequence. */
+  failedStep?: string
+  /** Compensation report, present at a terminal failure. */
+  compensation?: StoredCompensationReport
   runCount: number
   resumeSeq: number
+  stepSeq?: number
   createdAt: number
   updatedAt: number
   completedAt?: number
@@ -63,6 +90,8 @@ export type StoredStepStatus = "running" | "completed" | "failed" | "sleeping" |
 export interface StoredStepState {
   key: string
   type: StoredStepType
+  phase?: StoredStepPhase
+  seq?: number
   status: StoredStepStatus
   result?: unknown
   error?: StoredSerializedError
@@ -124,7 +153,7 @@ export function resumeJobId(originalJobId: string, resumeSeq: number): string {
 // bullmq-durable/utils/keys.ts.
 
 /** Terminal statuses that each get their own index bucket. */
-export type TerminalStatus = "completed" | "failed" | "cancelled"
+export type TerminalStatus = "completed" | "failed" | "compensation_failed" | "cancelled"
 
 /** `{prefix}:idx:active` — SET of non-terminal instance ids (bounded, in-flight). */
 export function activeIndexKey(prefix: string): string {
@@ -145,6 +174,7 @@ export function terminalIndexKey(prefix: string, status: TerminalStatus): string
 export const DEFAULT_RETENTION_MS: Record<TerminalStatus, number> = {
   completed: 24 * 60 * 60 * 1000,
   failed: 7 * 24 * 60 * 60 * 1000,
+  compensation_failed: 30 * 24 * 60 * 60 * 1000,
   cancelled: 24 * 60 * 60 * 1000,
 }
 
@@ -210,8 +240,12 @@ export function parseInstanceHash(hash: Record<string, string>): StoredInstanceS
     input: safeJsonParse(hash.input),
     output: safeJsonParse(hash.output),
     error: safeJsonParse(hash.error) as StoredSerializedError | undefined,
+    failureError: safeJsonParse(hash.failureError) as StoredSerializedError | undefined,
+    failedStep: hash.failedStep,
+    compensation: safeJsonParse(hash.compensation) as StoredCompensationReport | undefined,
     runCount: toInt(hash.runCount) ?? 0,
     resumeSeq: toInt(hash.resumeSeq) ?? 0,
+    stepSeq: toInt(hash.stepSeq),
     createdAt: toInt(hash.createdAt) ?? 0,
     updatedAt: toInt(hash.updatedAt) ?? 0,
     completedAt: toInt(hash.completedAt),
