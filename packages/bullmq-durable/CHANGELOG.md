@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.4] - 2026-06-30
+## [0.1.5] - 2026-06-30
 
 ### Changed
 
@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrate `@DurableProcess("video")` to `@DurableProcess()`, collapsing any
   per-name methods into one that switches on `job.name`. (For name-based routing,
   the core `DurableWorker` still accepts a `{ [name]: { run, onFailure } }` map.)
+
+## [0.1.4] - 2026-06-29
+
+### Changed
+
 - NestJS: `@DurableFailure()` no longer takes a job-name argument. One handler per
   `@DurableProcessor` settles every job on the queue — mirroring
   `@OnWorkerEvent('failed')`; read `job.name` inside to branch. A processor

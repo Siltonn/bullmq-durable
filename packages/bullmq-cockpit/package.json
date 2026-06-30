@@ -1,6 +1,6 @@
 {
   "name": "bullmq-cockpit",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Modern dashboard and durable instance inspector for BullMQ.",
   "type": "module",
   "license": "MIT",
