@@ -132,7 +132,7 @@ jobId: input.generationId,
 }
 @DurableProcessor("generation")
 export class GenerationProcessor {
-@DurableProcess("video")
+@DurableProcess()
 async run(
 job: DurableJob<CreateVideoInput, VideoResult>,
 ctx: DurableContext,

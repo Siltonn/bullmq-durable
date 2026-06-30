@@ -428,8 +428,10 @@ DurableBullModule.forRootAsync({
 })
 ```
 
-The processor is typed like a BullMQ processor — the job name is a free routing
-label, and the handler types its own payload through `DurableJob<Data, Result>`:
+The class's `@DurableProcessor` fixes the queue, so `@DurableProcess()` takes no
+argument — like `@nestjs/bullmq`'s single `process()`, it runs every job on the
+queue (branch on `job.name` inside if the queue carries several). The handler
+types its own payload through `DurableJob<Data, Result>`:
 
 ```ts
 import { Injectable } from "@nestjs/common"
@@ -444,7 +446,7 @@ import {
 
 @DurableProcessor("generation")
 export class GenerationProcessor {
-  @DurableProcess("video")
+  @DurableProcess()
   async run(
     job: DurableJob<CreateVideoInput, VideoResult>,
     ctx: DurableContext,
@@ -482,7 +484,7 @@ processor:
 ```ts
 @DurableProcessor("orders")
 export class CheckoutProcessor {
-  @DurableProcess("checkout")
+  @DurableProcess()
   async run(job: DurableJob<CheckoutInput, Receipt>, ctx: DurableContext) {
     /* … steps with onRollback … */
   }

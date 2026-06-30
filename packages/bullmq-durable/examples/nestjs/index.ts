@@ -30,9 +30,10 @@ const connection = { host: "127.0.0.1", port: 6379 }
 
 @DurableProcessor("generation")
 export class GenerationProcessor {
-  // "video" is a free routing label; the handler types its own payload — there
-  // is no name->payload map to declare.
-  @DurableProcess("video")
+  // One handler for the whole queue — the class's @DurableProcessor already fixes
+  // the queue, so no job name is needed. Branch on `job.name` if the queue
+  // carries several; the handler types its own payload.
+  @DurableProcess()
   async run(
     job: DurableJob<CreateVideoInput, VideoResult>,
     ctx: DurableContext,

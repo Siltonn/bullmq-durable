@@ -22,7 +22,6 @@ export type {
   DurableBullRootAsyncOptions,
   DurableBullRootOptions,
   DurableInjectionToken,
-  DurableProcessMetadata,
   DurableProcessorMetadata,
   DurableQueueAsyncRegistration,
   DurableQueueRegistration,

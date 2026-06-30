@@ -10,11 +10,11 @@ import {
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,
 } from "./tokens"
-import type { DurableProcessMetadata, DurableProcessorMetadata } from "./types"
+import type { DurableProcessorMetadata } from "./types"
 
 /**
- * Mark a provider class as the durable processor for `queueName`. Methods
- * inside it are wired to job names via {@link DurableProcess}.
+ * Mark a provider class as the durable processor for `queueName`. Its single
+ * {@link DurableProcess} method runs every job on the queue.
  */
 export function DurableProcessor(queueName: string): ClassDecorator {
   return SetMetadata(DURABLE_PROCESSOR_METADATA, {
@@ -22,9 +22,15 @@ export function DurableProcessor(queueName: string): ClassDecorator {
   } satisfies DurableProcessorMetadata)
 }
 
-/** Mark a method as the handler for `jobName` within a `@DurableProcessor`. */
-export function DurableProcess(jobName: string): MethodDecorator {
-  return SetMetadata(DURABLE_PROCESS_METADATA, { jobName } satisfies DurableProcessMetadata)
+/**
+ * Mark a method as the durable processor for its `@DurableProcessor` — it runs
+ * every job on the queue, whatever the job name (read `job.name` inside to
+ * branch). No argument: the class's `@DurableProcessor` already fixes the queue,
+ * so there's nothing more to scope. One per processor — mirroring
+ * `@nestjs/bullmq`'s single `process()` method.
+ */
+export function DurableProcess(): MethodDecorator {
+  return SetMetadata(DURABLE_PROCESS_METADATA, true)
 }
 
 /**

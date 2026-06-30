@@ -107,8 +107,3 @@ export type DurableWorkerFactory = (
 export interface DurableProcessorMetadata {
   queueName: string
 }
-
-/** Metadata attached by `@DurableProcess()`. */
-export interface DurableProcessMetadata {
-  jobName: string
-}

@@ -17,12 +17,7 @@ import {
 import { DiscoveryService, ModuleRef, Reflector } from "@nestjs/core"
 import type { StateStore } from "../store/state-store"
 import { DurableWorker } from "../worker"
-import type {
-  DurableFailureHandler,
-  DurableJobHandler,
-  DurableProcessor,
-  DurableWorkerOptions,
-} from "../types"
+import type { DurableFailureHandler, DurableProcessor, DurableWorkerOptions } from "../types"
 import { reuseSharedStore } from "./shared-store"
 import {
   DURABLE_BULL_OPTIONS,
@@ -35,7 +30,6 @@ import {
 } from "./tokens"
 import type {
   DurableBullRootOptions,
-  DurableProcessMetadata,
   DurableProcessorMetadata,
   DurableQueueRegistration,
   DurableWorkerFactory,
@@ -77,14 +71,15 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
       )
       if (!meta) continue
 
-      const { handlers, onFailure } = this.buildHandlerMap(instance)
-      if (Object.keys(handlers).length === 0) continue
+      const { processor, onFailure } = this.collectHandlers(instance)
+      // A @DurableProcessor with no @DurableProcess() method has nothing to run.
+      if (!processor) continue
 
       const options = this.resolveWorkerOptions(meta.queueName)
       // The processor's @DurableFailure() becomes the worker's terminal-failure
       // settlement, applied to every job on the queue.
       if (onFailure) options.onFailure = onFailure
-      this.workers.push(factory(meta.queueName, handlers, options))
+      this.workers.push(factory(meta.queueName, processor, options))
     }
   }
 
@@ -119,16 +114,17 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Build the `{ jobName: { run } }` handler map and the processor's single
-   * terminal-failure handler from its `@DurableProcess` and `@DurableFailure`
-   * methods. The failure handler settles every job on the processor and is wired
-   * as the worker's `onFailure`.
+   * Collect the processor's single forward handler (`@DurableProcess()`) and its
+   * single terminal-failure handler (`@DurableFailure()`), both bound to the
+   * instance. Each runs every job on the queue — the class's `@DurableProcessor`
+   * already fixes which queue — so neither takes a job name and a processor may
+   * declare at most one of each.
    */
-  private buildHandlerMap(instance: object): {
-    handlers: Record<string, DurableJobHandler>
+  private collectHandlers(instance: object): {
+    processor?: DurableProcessor
     onFailure?: DurableFailureHandler
   } {
-    const runs = new Map<string, DurableProcessor>()
+    const runs: { name: string; handler: DurableProcessor }[] = []
     const failures: { name: string; handler: DurableFailureHandler }[] = []
     const seen = new Set<string>()
 
@@ -144,12 +140,8 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
         const method = prototype[propertyName]
         if (typeof method !== "function") continue
 
-        const processMeta = this.reflector.get<DurableProcessMetadata>(
-          DURABLE_PROCESS_METADATA,
-          method,
-        )
-        if (processMeta && !runs.has(processMeta.jobName)) {
-          runs.set(processMeta.jobName, (method as DurableProcessor).bind(instance))
+        if (this.reflector.get<boolean>(DURABLE_PROCESS_METADATA, method)) {
+          runs.push({ name: propertyName, handler: (method as DurableProcessor).bind(instance) })
         }
 
         if (this.reflector.get<boolean>(DURABLE_FAILURE_METADATA, method)) {
@@ -162,21 +154,24 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
       prototype = Object.getPrototypeOf(prototype) as Record<string, unknown> | null
     }
 
-    // A processor settles all its jobs through one @DurableFailure() — there's no
-    // job name to tell several apart, so more than one is ambiguous.
-    if (failures.length > 1) {
-      const cls = (instance as { constructor?: { name?: string } }).constructor?.name ?? "processor"
+    const cls = (instance as { constructor?: { name?: string } }).constructor?.name ?? "processor"
+    this.assertAtMostOne(cls, "@DurableProcess()", runs)
+    this.assertAtMostOne(cls, "@DurableFailure()", failures)
+
+    return { processor: runs[0]?.handler, onFailure: failures[0]?.handler }
+  }
+
+  /**
+   * A `@DurableProcess()`/`@DurableFailure()` handler runs every job on the queue,
+   * so there's no job name to tell several apart — more than one is ambiguous.
+   */
+  private assertAtMostOne(cls: string, decorator: string, found: { name: string }[]): void {
+    if (found.length > 1) {
       throw new Error(
-        `"${cls}" has ${failures.length} @DurableFailure() handlers ` +
-          `([${failures.map((f) => f.name).join(", ")}]). A processor may declare at most one.`,
+        `"${cls}" has ${found.length} ${decorator} handlers ` +
+          `([${found.map((f) => f.name).join(", ")}]). A processor may declare at most one.`,
       )
     }
-
-    const handlers: Record<string, DurableJobHandler> = {}
-    for (const [jobName, run] of runs) {
-      handlers[jobName] = { run }
-    }
-    return { handlers, onFailure: failures[0]?.handler }
   }
 
   /** Merge per-queue registration options over the root defaults. */

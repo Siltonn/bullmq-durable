@@ -32,16 +32,11 @@ const CONNECTION = { host: "127.0.0.1", port: 6379 } as ConnectionOptions
 class GenerationProcessor {
   readonly calls: string[] = []
 
-  @DurableProcess("video")
-  async video(): Promise<string> {
-    this.calls.push("video")
-    return "video"
-  }
-
-  @DurableProcess("image")
-  async image(): Promise<string> {
-    this.calls.push("image")
-    return "image"
+  // One handler runs every job on the queue; branch on `job.name` if needed.
+  @DurableProcess()
+  async process(job: { name: string }): Promise<string> {
+    this.calls.push(job.name)
+    return job.name
   }
 
   // The processor's single terminal-failure handler — settles every job.
@@ -59,27 +54,22 @@ class GenerationService {
   constructor(@InjectDurableQueue("generation") readonly queue: DurableQueue) {}
 }
 
-// A processor that inherits a @DurableProcess method from a base class.
+// A processor that inherits its @DurableProcess() method from a base class.
 @DurableProcessor("media")
 class BaseMediaProcessor {
-  @DurableProcess("transcode")
-  async transcode(): Promise<string> {
-    return "transcode"
+  @DurableProcess()
+  async process(): Promise<string> {
+    return "media"
   }
 }
 
-class MediaProcessor extends BaseMediaProcessor {
-  @DurableProcess("thumbnail")
-  async thumbnail(): Promise<string> {
-    return "thumbnail"
-  }
-}
+class MediaProcessor extends BaseMediaProcessor {}
 
 // A processor that declares two @DurableFailure() handlers (ambiguous).
 @DurableProcessor("ambiguous")
 class AmbiguousFailureProcessor {
-  @DurableProcess("a")
-  async a(): Promise<string> {
+  @DurableProcess()
+  async process(): Promise<string> {
     return "a"
   }
 
@@ -88,6 +78,20 @@ class AmbiguousFailureProcessor {
 
   @DurableFailure()
   async second(): Promise<void> {}
+}
+
+// A processor that declares two @DurableProcess() handlers (ambiguous).
+@DurableProcessor("twoprocess")
+class TwoProcessProcessor {
+  @DurableProcess()
+  async first(): Promise<string> {
+    return "first"
+  }
+
+  @DurableProcess()
+  async second(): Promise<string> {
+    return "second"
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,19 +111,19 @@ describe("nestjs decorators & tokens", () => {
     })
 
     const prototype = Object.getPrototypeOf(instance)
-    expect(reflector.get(DURABLE_PROCESS_METADATA, prototype.video)).toEqual({ jobName: "video" })
+    // @DurableProcess() is an argument-less marker, like @DurableFailure().
+    expect(reflector.get(DURABLE_PROCESS_METADATA, prototype.process)).toBe(true)
     expect(reflector.get(DURABLE_PROCESS_METADATA, prototype.helper)).toBeUndefined()
   })
 })
 
 describe("DurableExplorer", () => {
-  it("discovers processors, builds a handler map, and starts one worker", async () => {
+  it("discovers a processor, wires its single handler, and starts one worker", async () => {
     const instance = new GenerationProcessor()
-    const created: Array<{ queueName: string; processor: Record<string, unknown>; options: any }> =
-      []
+    const created: Array<{ queueName: string; processor: unknown; options: any }> = []
 
     const factory: DurableWorkerFactory = (queueName, processor, options) => {
-      created.push({ queueName, processor: processor as Record<string, unknown>, options })
+      created.push({ queueName, processor, options })
       return { close: async () => undefined }
     }
 
@@ -149,23 +153,20 @@ describe("DurableExplorer", () => {
     expect(explorer.workerCount).toBe(1)
     expect(created).toHaveLength(1)
     expect(created[0]?.queueName).toBe("generation")
-    expect(Object.keys(created[0]!.processor).sort()).toEqual(["image", "video"])
+
+    // The single @DurableProcess() is passed as the bare-function form — it runs
+    // for any job name, bound to the instance.
+    expect(typeof created[0]!.processor).toBe("function")
+    await (created[0]!.processor as (job: { name: string }) => Promise<string>)({ name: "video" })
+    expect(instance.calls).toContain("video")
 
     // Queue override wins; root default fills the rest.
     expect(created[0]?.options.concurrency).toBe(5)
     expect(created[0]?.options.retention).toEqual({ completed: "7d" })
     expect(created[0]?.options.connection).toBe(CONNECTION)
 
-    // Handlers are bound to the instance, wrapped as `{ run }`.
-    const videoHandler = created[0]!.processor.video as { run: () => Promise<string> }
-    await videoHandler.run()
-    expect(instance.calls).toContain("video")
-
-    // @DurableFailure() is the worker-wide settlement, not attached per job...
-    expect((created[0]!.processor.video as { onFailure?: unknown }).onFailure).toBeUndefined()
-    expect((created[0]!.processor.image as { onFailure?: unknown }).onFailure).toBeUndefined()
-
-    // ...it is handed to the worker as options.onFailure, bound to the instance.
+    // @DurableFailure() is handed to the worker as options.onFailure, bound to
+    // the instance.
     expect(typeof created[0]!.options.onFailure).toBe("function")
     await created[0]!.options.onFailure()
     expect(instance.calls).toContain("failure")
@@ -190,11 +191,28 @@ describe("DurableExplorer", () => {
     expect(() => explorer.onModuleInit()).toThrow(/at most one/)
   })
 
-  it("discovers @DurableProcess methods inherited from a base class", () => {
+  it("throws when a processor declares more than one @DurableProcess()", () => {
+    const instance = new TwoProcessProcessor()
+    const factory: DurableWorkerFactory = () => ({ close: async () => undefined })
+    const discovery = { getProviders: () => [{ instance }] }
+    const moduleRef = {
+      get: (token: unknown) =>
+        token === DURABLE_BULL_OPTIONS ? { connection: CONNECTION } : undefined,
+    }
+    const explorer = new DurableExplorer(
+      discovery as never,
+      new Reflector(),
+      moduleRef as never,
+      factory,
+    )
+    expect(() => explorer.onModuleInit()).toThrow(/at most one/)
+  })
+
+  it("discovers a @DurableProcess() inherited from a base class", () => {
     const instance = new MediaProcessor()
-    const created: Array<Record<string, unknown>> = []
+    const created: unknown[] = []
     const factory: DurableWorkerFactory = (_queueName, processor) => {
-      created.push(processor as Record<string, unknown>)
+      created.push(processor)
       return { close: async () => undefined }
     }
     const discovery = { getProviders: () => [{ instance }] }
@@ -212,8 +230,8 @@ describe("DurableExplorer", () => {
     explorer.onModuleInit()
 
     expect(created).toHaveLength(1)
-    // Both the inherited `transcode` and the subclass's own `thumbnail`.
-    expect(Object.keys(created[0]!).sort()).toEqual(["thumbnail", "transcode"])
+    // The base class's @DurableProcess() is discovered on the subclass instance.
+    expect(typeof created[0]).toBe("function")
   })
 
   it("ignores providers without @DurableProcessor", async () => {
