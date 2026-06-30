@@ -15,16 +15,7 @@ import { type JobsOptions, Queue } from "bullmq"
 import type { ResumeScheduler, ScheduleResumeInput } from "./scheduler"
 import { RedisStateStore } from "./store/redis-store"
 import type { StateStore } from "./store/state-store"
-import type {
-  DurableJob,
-  DurableJobMap,
-  DurableLog,
-  DurableQueueOptions,
-  InstanceState,
-  JobData,
-  JobResult,
-  StepState,
-} from "./types"
+import type { DurableJob, DurableLog, DurableQueueOptions, InstanceState, StepState } from "./types"
 import { createInstanceId, DEFAULT_DURABLE_PREFIX, resumeJobId } from "./utils/keys"
 import { wrapResumeData } from "./envelope"
 import { DEFAULT_RETENTION } from "./types"
@@ -33,7 +24,11 @@ import { parseDuration } from "./utils/duration"
 /** BullMQ attempts for resume ticks when the caller does not override it. */
 const DEFAULT_RESUME_ATTEMPTS = 3
 
-export class DurableQueue<TJobs extends DurableJobMap = DurableJobMap> implements ResumeScheduler {
+export class DurableQueue<
+  TData = any,
+  TResult = any,
+  TName extends string = string,
+> implements ResumeScheduler {
   private queue?: Queue
   private store?: StateStore
   private ownsStore = false
@@ -77,18 +72,19 @@ export class DurableQueue<TJobs extends DurableJobMap = DurableJobMap> implement
   }
 
   /**
-   * Enqueue a durable job. Mirrors `Queue.add`, but the returned job is typed
-   * as a {@link DurableJob} and annotated with its (eventual) instance id.
+   * Enqueue a durable job. Mirrors `Queue.add`: the job `name` is a free routing
+   * label (like BullMQ), and the payload is typed by the queue's `TData`. The
+   * returned job is a {@link DurableJob} annotated with its (eventual) instance id.
    */
-  async add<TName extends keyof TJobs & string>(
+  async add(
     name: TName,
-    data: JobData<TJobs, TName>,
+    data: TData,
     opts?: JobsOptions,
-  ): Promise<DurableJob<JobData<TJobs, TName>, JobResult<TJobs, TName>, TName>> {
-    const job = await this.bull.add(name, data as JobData<TJobs, TName>, opts)
+  ): Promise<DurableJob<TData, TResult, TName>> {
+    const job = await this.bull.add(name, data, opts)
     return annotateDurable(job, createInstanceId(this.name, job.id ?? "")) as DurableJob<
-      JobData<TJobs, TName>,
-      JobResult<TJobs, TName>,
+      TData,
+      TResult,
       TName
     >
   }

@@ -92,7 +92,9 @@ function latestRunningStep(steps: StoredStepState[]): StoredStepState | undefine
 }
 
 function lastFailedStep(steps: StoredStepState[]): StoredStepState | undefined {
-  return [...steps].reverse().find((s) => s.status === "failed")
+  // Only forward (`main`-phase) failures are the "point of failure" a user debugs;
+  // an internal __rollback__/__failure__ step that failed must not be surfaced here.
+  return [...steps].reverse().find((s) => s.status === "failed" && (s.phase ?? "main") === "main")
 }
 
 /**

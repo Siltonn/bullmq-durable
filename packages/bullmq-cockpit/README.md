@@ -94,10 +94,50 @@ await fastify.register(createBullMQCockpit({ connection }), { prefix: "/admin/bu
 import { BullMQCockpitModule } from "bullmq-cockpit/nestjs"
 
 @Module({
-  imports: [BullMQCockpitModule.register({ path: "/admin/bullmq", connection })],
+  imports: [
+    BullMQCockpitModule.register({ path: "/admin/bullmq", connection, queues: ["emails"] }),
+  ],
 })
 export class AdminModule {}
 ```
+
+Under NestJS the dashboard **never auto-discovers** queues by scanning Redis — you
+declare them explicitly. List them at the root with `queues`, and/or contribute
+them from any feature module with `registerQueue` (mirrors
+`DurableBullModule.registerQueue`); the lists are merged:
+
+```ts
+@Module({
+  imports: [BullMQCockpitModule.registerQueue("media", "billing")],
+})
+export class MediaModule {}
+```
+
+Source `connection` (and `auth`) from DI with `registerAsync`:
+
+```ts
+@Module({
+  imports: [
+    BullMQCockpitModule.registerAsync({
+      path: "/admin/bullmq",
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+    }),
+  ],
+})
+export class AdminModule {}
+```
+
+The cockpit's Redis connections are built lazily and released automatically on
+application shutdown (enable `app.enableShutdownHooks()` to also release them on
+`SIGTERM`/`SIGINT`).
+
+Two caveats: this module targets the **default Express platform** — on
+`@nestjs/platform-fastify`, mount [`bullmq-cockpit/fastify`](#fastify) directly.
+And because the dashboard mounts as middleware, Nest guards/interceptors don't run
+for its routes — put authorization in the `auth` hook (whose `req` is the raw
+request).
 
 ### Hono (directly)
 

@@ -157,6 +157,17 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
       prototype = Object.getPrototypeOf(prototype) as Record<string, unknown> | null
     }
 
+    // An @DurableFailure whose jobName has no @DurableProcess is almost certainly a
+    // typo — fail loudly rather than silently never wiring the settlement handler.
+    const orphans = [...failures.keys()].filter((jobName) => !runs.has(jobName))
+    if (orphans.length > 0) {
+      const cls = (instance as { constructor?: { name?: string } }).constructor?.name ?? "processor"
+      throw new Error(
+        `@DurableFailure for job(s) [${orphans.join(", ")}] on "${cls}" has no matching ` +
+          `@DurableProcess. Add a @DurableProcess("<job>") with the same job name.`,
+      )
+    }
+
     const handlers: Record<string, DurableJobHandler> = {}
     for (const [jobName, run] of runs) {
       const onFailure = failures.get(jobName)

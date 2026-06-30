@@ -13,8 +13,11 @@ import type { DurableInspector } from "../durable-inspector"
 export interface BullMQInspectorDeps {
   redis: Redis
   bullPrefix: string
-  /** Explicit queue allow-list, or `null` to auto-discover from Redis. */
-  queues: string[] | null
+  /**
+   * Explicit queue allow-list (or a function resolving one per request), or
+   * `null` to auto-discover from Redis.
+   */
+  queues: string[] | (() => string[]) | null
   getQueue: (name: string) => Queue
   durable?: DurableInspector
 }
@@ -85,7 +88,9 @@ const discoveryCache = new WeakMap<BullMQInspectorDeps, Promise<string[]>>()
 
 /** Resolve the queue names this cockpit exposes (allow-list or auto-discovered). */
 export async function resolveQueueNames(deps: BullMQInspectorDeps): Promise<string[]> {
-  if (deps.queues) return [...deps.queues]
+  if (deps.queues) {
+    return typeof deps.queues === "function" ? [...deps.queues()] : [...deps.queues]
+  }
   let discovered = discoveryCache.get(deps)
   if (!discovered) {
     discovered = discoverQueues(deps.redis, deps.bullPrefix).catch((err) => {

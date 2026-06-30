@@ -19,10 +19,13 @@ export {
   getDurableQueueOptionsToken,
 } from "./tokens"
 export type {
+  DurableBullRootAsyncOptions,
   DurableBullRootOptions,
   DurableFailureMetadata,
+  DurableInjectionToken,
   DurableProcessMetadata,
   DurableProcessorMetadata,
+  DurableQueueAsyncRegistration,
   DurableQueueRegistration,
   DurableWorkerFactory,
   DurableWorkerHandle,
@@ -35,5 +38,4 @@ export type {
   DurableFailureHandler,
   DurableFailureInfo,
   DurableJob,
-  DurableJobMap,
 } from "../types"

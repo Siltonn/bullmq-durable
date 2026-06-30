@@ -73,7 +73,7 @@ export class TestEngine {
   }
 
   constructor(
-    private readonly processor: DurableProcessorInput<any>,
+    private readonly processor: DurableProcessorInput,
     private readonly options: TestEngineOptions = {},
   ) {
     this.store = options.store ?? new MemoryStateStore()
@@ -200,7 +200,7 @@ export class TestEngine {
     if (typeof this.processor === "function") {
       return this.processor as DurableProcessor
     }
-    const handlers = this.processor as DurableProcessorHandlers<any>
+    const handlers = this.processor as DurableProcessorHandlers
     const handler = handlers[jobName]
     if (!handler) throw new Error(`No processor for job "${jobName}"`)
     if (typeof handler === "function") return handler as DurableProcessor
@@ -210,7 +210,7 @@ export class TestEngine {
   /** Per-job `onFailure` from a `{ run, onFailure }` handler entry, if present. */
   private resolveOnFailure(jobName: string): DurableFailureHandler | undefined {
     if (typeof this.processor === "function") return undefined
-    const handler = (this.processor as DurableProcessorHandlers<any>)[jobName]
+    const handler = (this.processor as DurableProcessorHandlers)[jobName]
     if (!handler || typeof handler === "function") return undefined
     return (handler as DurableJobHandler).onFailure
   }

@@ -34,6 +34,8 @@ import { cloneValue, deserializeError, serializeError } from "./utils/serialize"
 export interface RegisteredRollback {
   /** The forward step's (raw) key. */
   key: string
+  /** The forward step's monotonic seq — the stable order key for reverse compensation. */
+  seq: number
   /** The forward step's checkpoint snapshot. */
   output: unknown
   handler: RollbackFn<unknown>
@@ -124,12 +126,17 @@ export class DurableContextImpl implements DurableContext {
   }
 
   /** Record a completed step's `onRollback` closure (main phase only). */
-  private registerRollback(key: string, output: unknown, options: StepOptions<any>): void {
+  private registerRollback(
+    key: string,
+    seq: number,
+    output: unknown,
+    options: StepOptions<any>,
+  ): void {
     if (this.phase !== "main" || !options.onRollback) return
     const onRb = options.onRollback
     const handler = (typeof onRb === "function" ? onRb : onRb.handler) as RollbackFn<unknown>
     const retry = typeof onRb === "function" ? undefined : onRb.retry
-    this.rollbacks.push({ key, output, handler, retry })
+    this.rollbacks.push({ key, seq, output, handler, retry })
   }
 
   // -- Steps ---------------------------------------------------------------
@@ -149,7 +156,7 @@ export class DurableContextImpl implements DurableContext {
     if (existing?.status === "completed") {
       // Replay: return the checkpointed result without re-running the body. The
       // rollback closure is re-registered from the CURRENT code's options.
-      this.registerRollback(key, existing.result, options)
+      this.registerRollback(key, existing.seq ?? 0, existing.result, options)
       return existing.result as T
     }
     if (existing?.status === "failed") {
@@ -194,7 +201,7 @@ export class DurableContextImpl implements DurableContext {
         startedAt,
         completedAt: Date.now(),
       })
-      this.registerRollback(key, checkpointed, options)
+      this.registerRollback(key, seq, checkpointed, options)
       return checkpointed
     } catch (error) {
       return await this.handleStepError<T>(key, storeKey, seq, error, options, attempts, startedAt)

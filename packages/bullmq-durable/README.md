@@ -34,7 +34,7 @@ new DurableWorker(
 7. [Retry policy](#7-retry-policy)
 8. [Redis persistence ⚠️](#8-redis-persistence-)
 9. [NestJS integration](#9-nestjs-integration)
-10. [TypeScript job map](#10-typescript-job-map)
+10. [TypeScript typing](#10-typescript-typing)
 11. [Production checklist](#11-production-checklist)
 12. [Limitations](#12-limitations)
 13. [Roadmap](#13-roadmap)
@@ -332,12 +332,29 @@ import { DurableBullModule } from "bullmq-durable/nestjs"
     DurableBullModule.registerQueue({
       name: "generation",
       retention: { completed: "7d", failed: "30d" },
+      // List the processor here and it is auto-registered — no `providers` entry,
+      // so the explorer can never silently miss it.
+      processor: GenerationProcessor,
     }),
   ],
-  providers: [GenerationProcessor, GenerationService],
+  providers: [GenerationService],
 })
 export class GenerationModule {}
 ```
+
+Source `connection` from DI (e.g. a `ConfigService`) with the async forms —
+`forRootAsync({ inject, useFactory })` and `registerQueueAsync({ name, inject, useFactory })`:
+
+```ts
+DurableBullModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+})
+```
+
+The processor is typed like a BullMQ processor — the job name is a free routing
+label, and the handler types its own payload through `DurableJob<Data, Result>`:
 
 ```ts
 import { Injectable } from "@nestjs/common"
@@ -366,7 +383,9 @@ export class GenerationProcessor {
 @Injectable()
 export class GenerationService {
   constructor(
-    @InjectDurableQueue("generation") private readonly queue: DurableQueue<GenerationJobs>,
+    // Payload-typed, exactly like a BullMQ `Queue<Data, Result>`.
+    @InjectDurableQueue("generation")
+    private readonly queue: DurableQueue<CreateVideoInput, VideoResult>,
   ) {}
 
   createVideo(input: CreateVideoInput) {
@@ -381,28 +400,20 @@ the root defaults.
 
 See [`examples/nestjs`](./examples/nestjs).
 
-## 10. TypeScript job map
+## 10. TypeScript typing
 
-Describe your jobs once and get end-to-end inference on `queue.add` and worker
-handlers:
+Typing follows BullMQ: the queue is typed by its **payload**, and the job name is
+a free label you choose at `add` time — there is no name→payload map to declare.
 
 ```ts
-type GenerationJobs = {
-  video: { data: CreateVideoInput; result: VideoResult }
-  image: { data: CreateImageInput; result: ImageResult }
-}
-
-const queue = new DurableQueue<GenerationJobs>("generation", { connection })
+const queue = new DurableQueue<CreateVideoInput, VideoResult>("generation", { connection })
 await queue.add("video", { userId: "u1", prompt: "hello" }) // ✅ data is type-checked
 
-new DurableWorker<GenerationJobs>(
-  "generation",
-  {
-    video: async (job, ctx) => ({ videoUrl: "..." }), // job.data: CreateVideoInput
-    image: async (job, ctx) => ({ imageUrl: "..." }),
-  },
-  { connection },
-)
+new DurableWorker("generation", {
+  // Each handler types its own payload; the name is just a routing label.
+  video: async (job: DurableJob<CreateVideoInput, VideoResult>, ctx) => ({ videoUrl: "..." }),
+  image: async (job: DurableJob<CreateImageInput, ImageResult>, ctx) => ({ imageUrl: "..." }),
+}, { connection })
 ```
 
 ## 11. Production checklist

@@ -48,7 +48,7 @@ export interface DurableStep {
   status: DurableStepStatus
   attempts: number
   maxAttempts?: number
-  /** Monotonic per-instance order key (display only). */
+  /** Monotonic per-instance order key (stable step timeline; orders compensation). */
   seq?: number
   startedAt?: number
   completedAt?: number

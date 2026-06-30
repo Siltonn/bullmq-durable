@@ -88,10 +88,11 @@ export interface StepState {
   /** Lifecycle phase. Absent is treated as `"main"` (back-compat with 0.1.x). */
   phase?: StepPhase
   /**
-   * Monotonic per-instance sequence, allocated at first persist. Display-only:
-   * gives cockpit a stable, collision-free execution order (forward steps, then
-   * compensation in reverse, then failure handling). Does NOT affect runtime
-   * correctness — compensation order comes from replay call order, not `seq`.
+   * Monotonic per-instance sequence, allocated once at the step's first persist
+   * (reused on replay). It is the stable order key for compensation — rollbacks
+   * run in reverse `seq` order (reverse of execution-start), which stays
+   * deterministic across resumes even for steps started concurrently. Also gives
+   * cockpit a collision-free step timeline.
    */
   seq?: number
   status: StepStatus
@@ -175,26 +176,8 @@ export interface DurableLog {
 }
 
 // ---------------------------------------------------------------------------
-// Job map typing
+// Job typing
 // ---------------------------------------------------------------------------
-
-/** Describes the input/output shape of one named job. */
-export interface DurableJobSpec {
-  data: unknown
-  result: unknown
-}
-
-/** A map of job name -> {@link DurableJobSpec}, used for end-to-end typing. */
-export type DurableJobMap = Record<string, DurableJobSpec>
-
-/** Extract the `data` type for job `TName` from a job map. */
-export type JobData<TJobs extends DurableJobMap, TName extends keyof TJobs> = TJobs[TName]["data"]
-
-/** Extract the `result` type for job `TName` from a job map. */
-export type JobResult<
-  TJobs extends DurableJobMap,
-  TName extends keyof TJobs,
-> = TJobs[TName]["result"]
 
 /**
  * A BullMQ {@link Job} augmented with its durable instance id. The `data`
@@ -307,20 +290,22 @@ export interface DurableJobHandler<
   onFailure?: DurableFailureHandler<TData, TResult>
 }
 
-/** A map of job name -> processor (or `{ run, onFailure }`), for multi-job workers. */
-export type DurableProcessorHandlers<TJobs extends DurableJobMap> = {
-  [K in keyof TJobs & string]:
-    | DurableProcessor<JobData<TJobs, K>, JobResult<TJobs, K>, K>
-    | DurableJobHandler<JobData<TJobs, K>, JobResult<TJobs, K>, K>
-}
+/**
+ * A map of job name -> processor (or `{ run, onFailure }`), for multi-job
+ * workers. The job name is a free routing label (BullMQ-style); each handler
+ * types its own payload through its `DurableJob<Data, Result>` parameter, so
+ * there is no central name->payload map to declare.
+ */
+export type DurableProcessorHandlers = Record<
+  string,
+  DurableProcessor<any, any, string> | DurableJobHandler<any, any, string>
+>
 
 /**
  * The processor argument accepted by `DurableWorker`: either a single function
  * that handles every job name, or a per-name handler map.
  */
-export type DurableProcessorInput<TJobs extends DurableJobMap> =
-  | DurableProcessor<any, any, string>
-  | DurableProcessorHandlers<TJobs>
+export type DurableProcessorInput = DurableProcessor<any, any, string> | DurableProcessorHandlers
 
 // ---------------------------------------------------------------------------
 // Options

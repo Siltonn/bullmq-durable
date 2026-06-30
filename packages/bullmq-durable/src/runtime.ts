@@ -277,10 +277,14 @@ export class DurableRuntime {
     const registered = ctx.takeRollbacks()
     if (registered.length === 0) return report
 
+    // Reverse of execution order, keyed by the persisted `seq` (stable across
+    // resumes). Sorting by `seq` rather than registration order makes the order
+    // deterministic even for steps started concurrently — registration order can
+    // differ between the first failing tick and a compensation resume.
+    const ordered = [...registered].sort((a, b) => b.seq - a.seq)
+
     ctx.setPhase("compensation")
-    for (let i = registered.length - 1; i >= 0; i--) {
-      const rb = registered[i]
-      if (!rb) continue
+    for (const rb of ordered) {
       const retry = rb.retry ?? this.params.defaultRollbackRetry ?? DEFAULT_ROLLBACK_RETRY
       try {
         await ctx.step(rb.key, { retry }, () => rb.handler({ output: rb.output, error }))
