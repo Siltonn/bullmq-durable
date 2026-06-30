@@ -35,7 +35,6 @@ import {
 } from "./tokens"
 import type {
   DurableBullRootOptions,
-  DurableFailureMetadata,
   DurableProcessMetadata,
   DurableProcessorMetadata,
   DurableQueueRegistration,
@@ -78,10 +77,13 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
       )
       if (!meta) continue
 
-      const handlers = this.buildHandlerMap(instance)
+      const { handlers, onFailure } = this.buildHandlerMap(instance)
       if (Object.keys(handlers).length === 0) continue
 
       const options = this.resolveWorkerOptions(meta.queueName)
+      // The processor's @DurableFailure() becomes the worker's terminal-failure
+      // settlement, applied to every job on the queue.
+      if (onFailure) options.onFailure = onFailure
       this.workers.push(factory(meta.queueName, handlers, options))
     }
   }
@@ -117,13 +119,17 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Build a `{ jobName: { run, onFailure? } }` map from `@DurableProcess` and
-   * `@DurableFailure` methods. A job with a sibling `@DurableFailure` gets its
-   * terminal-failure settlement wired automatically.
+   * Build the `{ jobName: { run } }` handler map and the processor's single
+   * terminal-failure handler from its `@DurableProcess` and `@DurableFailure`
+   * methods. The failure handler settles every job on the processor and is wired
+   * as the worker's `onFailure`.
    */
-  private buildHandlerMap(instance: object): Record<string, DurableJobHandler> {
+  private buildHandlerMap(instance: object): {
+    handlers: Record<string, DurableJobHandler>
+    onFailure?: DurableFailureHandler
+  } {
     const runs = new Map<string, DurableProcessor>()
-    const failures = new Map<string, DurableFailureHandler>()
+    const failures: { name: string; handler: DurableFailureHandler }[] = []
     const seen = new Set<string>()
 
     // Walk the whole prototype chain so decorated methods inherited from a base
@@ -146,34 +152,31 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
           runs.set(processMeta.jobName, (method as DurableProcessor).bind(instance))
         }
 
-        const failureMeta = this.reflector.get<DurableFailureMetadata>(
-          DURABLE_FAILURE_METADATA,
-          method,
-        )
-        if (failureMeta && !failures.has(failureMeta.jobName)) {
-          failures.set(failureMeta.jobName, (method as DurableFailureHandler).bind(instance))
+        if (this.reflector.get<boolean>(DURABLE_FAILURE_METADATA, method)) {
+          failures.push({
+            name: propertyName,
+            handler: (method as DurableFailureHandler).bind(instance),
+          })
         }
       }
       prototype = Object.getPrototypeOf(prototype) as Record<string, unknown> | null
     }
 
-    // An @DurableFailure whose jobName has no @DurableProcess is almost certainly a
-    // typo — fail loudly rather than silently never wiring the settlement handler.
-    const orphans = [...failures.keys()].filter((jobName) => !runs.has(jobName))
-    if (orphans.length > 0) {
+    // A processor settles all its jobs through one @DurableFailure() — there's no
+    // job name to tell several apart, so more than one is ambiguous.
+    if (failures.length > 1) {
       const cls = (instance as { constructor?: { name?: string } }).constructor?.name ?? "processor"
       throw new Error(
-        `@DurableFailure for job(s) [${orphans.join(", ")}] on "${cls}" has no matching ` +
-          `@DurableProcess. Add a @DurableProcess("<job>") with the same job name.`,
+        `"${cls}" has ${failures.length} @DurableFailure() handlers ` +
+          `([${failures.map((f) => f.name).join(", ")}]). A processor may declare at most one.`,
       )
     }
 
     const handlers: Record<string, DurableJobHandler> = {}
     for (const [jobName, run] of runs) {
-      const onFailure = failures.get(jobName)
-      handlers[jobName] = onFailure ? { run, onFailure } : { run }
+      handlers[jobName] = { run }
     }
-    return handlers
+    return { handlers, onFailure: failures[0]?.handler }
   }
 
   /** Merge per-queue registration options over the root defaults. */

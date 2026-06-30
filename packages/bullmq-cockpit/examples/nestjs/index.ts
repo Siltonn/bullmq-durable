@@ -5,11 +5,13 @@
  * (shown here with a tiny config provider — swap in your own `ConfigService`).
  * The cockpit's Redis connections are built lazily and released on shutdown.
  *
- * NOTE: targets the default Express platform. On `@nestjs/platform-fastify`,
- * mount `bullmq-cockpit/fastify` directly instead of this module.
+ * The same module works on **both** platforms — the default Express one and
+ * `@nestjs/platform-fastify` — with no extra configuration (see `bootstrap`
+ * below). Nest's Fastify platform bundles middie, so the middleware just works.
  */
 
 import { Injectable, Module } from "@nestjs/common"
+import { NestFactory } from "@nestjs/core"
 import { BullMQCockpitModule } from "bullmq-cockpit/nestjs"
 
 const connection = { host: "127.0.0.1", port: 6379 }
@@ -57,3 +59,22 @@ export class ConfigModule {}
   ],
 })
 export class AsyncAdminModule {}
+
+// --- Bootstrapping on either platform ---------------------------------------
+// The module is identical across platforms; only the app factory differs.
+
+/** Default Express platform. */
+export async function bootstrap(): Promise<void> {
+  const app = await NestFactory.create(SimpleAdminModule)
+  await app.listen(3000)
+  // Dashboard → http://localhost:3000/admin/bullmq
+}
+
+// For Fastify, the module above is unchanged — only swap the adapter:
+//
+//   import { FastifyAdapter } from "@nestjs/platform-fastify"
+//   const app = await NestFactory.create(SimpleAdminModule, new FastifyAdapter())
+//   await app.listen(3000)
+//
+// Nest's Fastify platform bundles the middie engine, so the dashboard middleware
+// runs with no extra configuration.

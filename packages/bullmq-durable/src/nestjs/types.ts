@@ -112,8 +112,3 @@ export interface DurableProcessorMetadata {
 export interface DurableProcessMetadata {
   jobName: string
 }
-
-/** Metadata attached by `@DurableFailure()`. */
-export interface DurableFailureMetadata {
-  jobName: string
-}

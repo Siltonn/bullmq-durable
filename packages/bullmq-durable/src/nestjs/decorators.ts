@@ -10,11 +10,7 @@ import {
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,
 } from "./tokens"
-import type {
-  DurableFailureMetadata,
-  DurableProcessMetadata,
-  DurableProcessorMetadata,
-} from "./types"
+import type { DurableProcessMetadata, DurableProcessorMetadata } from "./types"
 
 /**
  * Mark a provider class as the durable processor for `queueName`. Methods
@@ -32,11 +28,12 @@ export function DurableProcess(jobName: string): MethodDecorator {
 }
 
 /**
- * Mark a method as the terminal-failure handler for `jobName` within a
- * `@DurableProcessor`. It runs (after per-step compensation) only for genuine
- * failures — control-flow signals never reach it — and receives
- * `(job, ctx, failure)`.
+ * Mark a method as the terminal-failure handler for its `@DurableProcessor`. One
+ * handler settles every job on the processor — mirroring `@OnWorkerEvent('failed')`,
+ * read `job.name` inside if you need to branch. It runs (after per-step
+ * compensation) only for genuine failures — control-flow signals never reach it —
+ * and receives `(job, ctx, failure)`.
  */
-export function DurableFailure(jobName: string): MethodDecorator {
-  return SetMetadata(DURABLE_FAILURE_METADATA, { jobName } satisfies DurableFailureMetadata)
+export function DurableFailure(): MethodDecorator {
+  return SetMetadata(DURABLE_FAILURE_METADATA, true)
 }
