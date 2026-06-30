@@ -3,33 +3,53 @@
 import type { Paginated, SerializedError } from "./common"
 
 /** The raw, persisted instance status. */
-export type DurableInstanceStatus = "running" | "yielded" | "completed" | "failed" | "cancelled"
+export type DurableInstanceStatus =
+  | "running"
+  | "yielded"
+  | "compensating"
+  | "completed"
+  | "failed"
+  | "compensation_failed"
+  | "cancelled"
 
 /**
  * A friendlier status derived for the UI. The runtime collapses sleep / retry /
  * `retryLater` into a single `yielded` status; we split it back apart by
  * inspecting the in-flight step so the dashboard can show "sleeping" vs
- * "retrying" vs "waiting".
+ * "retrying" vs "waiting". `compensating` / `compensation_failed` pass through.
  */
 export type DurableDerivedStatus =
   | "running"
   | "sleeping"
   | "retrying"
   | "waiting"
+  | "compensating"
   | "completed"
   | "failed"
+  | "compensation_failed"
   | "cancelled"
 
 export type DurableStepType = "step" | "sleep"
 
 export type DurableStepStatus = "running" | "completed" | "failed" | "sleeping" | "skipped"
 
+/**
+ * Lifecycle phase of a step. `main` is the forward run; `compensation` is a
+ * per-step `onRollback`; `failure` is a step inside the `onFailure` handler.
+ * Absent means `main` (older data).
+ */
+export type DurableStepPhase = "main" | "compensation" | "failure"
+
 export interface DurableStep {
   key: string
   type: DurableStepType
+  /** Lifecycle phase; absent means `main`. */
+  phase?: DurableStepPhase
   status: DurableStepStatus
   attempts: number
   maxAttempts?: number
+  /** Monotonic per-instance order key (display only). */
+  seq?: number
   startedAt?: number
   completedAt?: number
   failedAt?: number
@@ -40,6 +60,19 @@ export interface DurableStep {
   /** For `sleep` steps, the wall-clock time the sleep elapses/elapsed. */
   sleepUntil?: number
   error?: SerializedError
+}
+
+/** One compensation's outcome, surfaced in the instance detail. */
+export interface DurableCompensationOutcome {
+  key: string
+  status: "rolled-back" | "failed" | "skipped"
+  error?: SerializedError
+}
+
+/** Report of the compensation phase that ran on terminal failure. */
+export interface DurableCompensationReport {
+  rolledBack: string[]
+  failed: DurableCompensationOutcome[]
 }
 
 /** The four classes of "stuck" durable instance the dashboard surfaces. */
@@ -79,6 +112,10 @@ export interface DurableInstanceDetail extends DurableInstanceSummary {
   input?: unknown
   output?: unknown
   error?: SerializedError
+  /** The step whose failure triggered the terminal sequence, if any. */
+  failedStep?: string
+  /** Compensation report, present once the instance reaches a terminal failure. */
+  compensation?: DurableCompensationReport
   steps: DurableStep[]
   stepCount: number
   completedSteps: number
@@ -113,8 +150,10 @@ export interface DurableStatusCounts {
   sleeping: number
   retrying: number
   waiting: number
+  compensating: number
   completed: number
   failed: number
+  compensation_failed: number
   cancelled: number
   stuck: number
   total: number

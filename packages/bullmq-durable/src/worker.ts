@@ -15,6 +15,7 @@ import { DurableRuntime, type RunOutcome } from "./runtime"
 import { RedisStateStore } from "./store/redis-store"
 import type { StateStore } from "./store/state-store"
 import type {
+  DurableFailureHandler,
   DurableJob,
   DurableJobMap,
   DurableProcessor,
@@ -79,6 +80,12 @@ export class DurableWorker<TJobs extends DurableJobMap = DurableJobMap> {
       configurable: true,
     })
 
+    const handler = resolveDurableHandler(
+      this.processorInput as DurableProcessorInput<DurableJobMap>,
+      job.name,
+      this.queueName,
+    )
+
     const runtime = new DurableRuntime({
       instanceId,
       queueName: this.queueName,
@@ -89,17 +96,15 @@ export class DurableWorker<TJobs extends DurableJobMap = DurableJobMap> {
       store: this.store,
       scheduler: this.resumeQueue,
       defaultStepOptions: this.options.defaultStepOptions,
+      defaultRollbackRetry: this.options.defaultRollbackRetry,
+      // A per-job onFailure wins over the worker-level default.
+      onFailure: handler.onFailure ?? this.options.onFailure,
       retention: this.options.retention,
       lockTimeoutMs: this.lockTimeoutMs,
       maxLogs: this.maxLogs,
     })
 
-    const processor = resolveDurableProcessor(
-      this.processorInput as DurableProcessorInput<DurableJobMap>,
-      job.name,
-      this.queueName,
-    )
-    return runOutcomeToReturn(await runtime.run(processor))
+    return runOutcomeToReturn(await runtime.run(handler.run))
   }
 
   private buildWorkerOptions(): WorkerOptions {
@@ -162,24 +167,48 @@ export function runOutcomeToReturn(outcome: RunOutcome): unknown {
   }
 }
 
+/** A resolved per-job handler: the forward processor + optional failure hook. */
+export interface ResolvedDurableHandler {
+  run: DurableProcessor
+  onFailure?: DurableFailureHandler
+}
+
 /**
- * Pick the processor for a job name — either a single function (handles every
- * job) or a per-name handler map. Exported for unit testing.
+ * Resolve the `{ run, onFailure }` for a job name — accepting a single function
+ * (handles every job), a per-name function, or a per-name `{ run, onFailure }`
+ * object. Exported for unit testing.
+ */
+export function resolveDurableHandler(
+  input: DurableProcessorInput<DurableJobMap>,
+  jobName: string,
+  queueName: string,
+): ResolvedDurableHandler {
+  if (typeof input === "function") {
+    return { run: input as DurableProcessor }
+  }
+  const entry = (input as DurableProcessorHandlers<DurableJobMap>)[jobName]
+  if (!entry) {
+    throw new Error(
+      `DurableWorker: no processor registered for job "${jobName}" on queue "${queueName}"`,
+    )
+  }
+  if (typeof entry === "function") {
+    return { run: entry as DurableProcessor }
+  }
+  return {
+    run: entry.run as DurableProcessor,
+    onFailure: entry.onFailure as DurableFailureHandler | undefined,
+  }
+}
+
+/**
+ * Pick the processor function for a job name. Retained for back-compat;
+ * delegates to {@link resolveDurableHandler}. Exported for unit testing.
  */
 export function resolveDurableProcessor(
   input: DurableProcessorInput<DurableJobMap>,
   jobName: string,
   queueName: string,
 ): DurableProcessor {
-  if (typeof input === "function") {
-    return input as DurableProcessor
-  }
-  const handlers = input as DurableProcessorHandlers<DurableJobMap>
-  const handler = handlers[jobName]
-  if (!handler) {
-    throw new Error(
-      `DurableWorker: no processor registered for job "${jobName}" on queue "${queueName}"`,
-    )
-  }
-  return handler as DurableProcessor
+  return resolveDurableHandler(input, jobName, queueName).run
 }

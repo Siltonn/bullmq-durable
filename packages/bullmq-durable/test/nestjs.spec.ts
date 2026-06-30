@@ -11,6 +11,7 @@ import {
   DURABLE_WORKER_FACTORY,
   DurableBullModule,
   DurableExplorer,
+  DurableFailure,
   DurableProcess,
   DurableProcessor,
   DurableQueue,
@@ -41,6 +42,12 @@ class GenerationProcessor {
   async image(): Promise<string> {
     this.calls.push("image")
     return "image"
+  }
+
+  // A sibling @DurableFailure is wired as the job's onFailure settlement.
+  @DurableFailure("video")
+  async onVideoFailure(): Promise<void> {
+    this.calls.push("video-failure")
   }
 
   // A method without the decorator must be ignored by discovery.
@@ -134,9 +141,20 @@ describe("DurableExplorer", () => {
     expect(created[0]?.options.retention).toEqual({ completed: "7d" })
     expect(created[0]?.options.connection).toBe(CONNECTION)
 
-    // Handlers are bound to the instance.
-    await (created[0]!.processor.video as () => Promise<string>)()
+    // Handlers are bound to the instance, wrapped as `{ run, onFailure? }`.
+    const videoHandler = created[0]!.processor.video as {
+      run: () => Promise<string>
+      onFailure?: () => Promise<void>
+    }
+    await videoHandler.run()
     expect(instance.calls).toContain("video")
+
+    // The sibling @DurableFailure is wired as the job's onFailure handler.
+    expect(typeof videoHandler.onFailure).toBe("function")
+    await videoHandler.onFailure!()
+    expect(instance.calls).toContain("video-failure")
+    // A job without @DurableFailure has no onFailure.
+    expect((created[0]!.processor.image as { onFailure?: unknown }).onFailure).toBeUndefined()
 
     await explorer.onModuleDestroy()
   })

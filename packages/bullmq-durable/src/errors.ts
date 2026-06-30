@@ -94,3 +94,18 @@ export function isYieldError(error: unknown): error is DurableYieldError {
 export function isRetryLaterError(error: unknown): error is RetryLaterError {
   return error instanceof RetryLaterError
 }
+
+/**
+ * Type guard for *any* durable control-flow signal — yield, retry-later, or
+ * cancellation. None of these are real failures: they are interpreted by the
+ * runtime, not settled as errors. Use it to re-throw signals from a `catch`
+ * without having to remember every variant (forgetting `DurableCancelledError`
+ * is a common footgun that makes a cancelled job run its failure settlement).
+ */
+export function isDurableControlSignal(error: unknown): boolean {
+  return (
+    error instanceof DurableYieldError ||
+    error instanceof RetryLaterError ||
+    error instanceof DurableCancelledError
+  )
+}

@@ -34,6 +34,9 @@ export const Icons = {
   active: "hugeicons:flash",
   delayed: "hugeicons:clock-01",
   stuck: "hugeicons:alert-diamond",
+  compensating: "hugeicons:arrow-reload-horizontal",
+  compensationFailed: "hugeicons:alert-diamond",
+  rollback: "hugeicons:arrow-turn-backward",
 
   // Actions
   retry: "hugeicons:refresh",

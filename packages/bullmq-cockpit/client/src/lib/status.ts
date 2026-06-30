@@ -36,8 +36,10 @@ const DURABLE_STATUS: Record<DurableDerivedStatus, StatusMeta> = {
   sleeping: { label: "Sleeping", color: "default", icon: "sleeping" },
   retrying: { label: "Retrying", color: "warning", icon: "retrying" },
   waiting: { label: "Waiting", color: "default", icon: "waiting" },
+  compensating: { label: "Compensating", color: "warning", icon: "compensating" },
   completed: { label: "Completed", color: "success", icon: "completed" },
   failed: { label: "Failed", color: "danger", icon: "failed" },
+  compensation_failed: { label: "Compensation failed", color: "danger", icon: "compensationFailed" },
   cancelled: { label: "Cancelled", color: "default", icon: "cancelled" },
 }
 

@@ -8,15 +8,19 @@ export const DUR_DOT: Record<string, string> = {
   running: "bg-secondary",
   sleeping: "bg-default-300",
   retrying: "bg-warning",
+  compensating: "bg-warning",
   completed: "bg-success",
   failed: "bg-danger",
+  compensation_failed: "bg-danger",
 }
 export const DUR_TEXT: Record<string, string> = {
   running: "text-secondary",
   sleeping: "text-foreground-700",
   retrying: "text-warning",
+  compensating: "text-warning",
   completed: "text-success",
   failed: "text-danger",
+  compensation_failed: "text-danger",
 }
 
 /**
@@ -59,6 +63,21 @@ export function DurableSummary({
                 {d.stuck} stuck
               </Chip>
             )}
+            {d.compensation_failed > 0 && (
+              <Chip
+                size="sm"
+                variant="flat"
+                color="danger"
+                startContent={<CockpitIcon name="compensationFailed" width={12} />}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onStatus("compensation_failed")
+                }}
+                className="cursor-pointer"
+              >
+                {d.compensation_failed} needs attention
+              </Chip>
+            )}
           </button>
           <span className="shrink-0 text-xs tabular-nums text-foreground-400">
             {formatNumber(d.total)} total
@@ -71,7 +90,9 @@ export function DurableSummary({
             { label: "Running", value: d.running, className: "bg-secondary" },
             { label: "Sleeping", value: d.sleeping, className: "bg-default-300" },
             { label: "Retrying", value: d.retrying, className: "bg-warning" },
+            { label: "Compensating", value: d.compensating, className: "bg-warning/70" },
             { label: "Failed", value: d.failed, className: "bg-danger" },
+            { label: "Compensation failed", value: d.compensation_failed, className: "bg-danger/80" },
             { label: "Cancelled", value: d.cancelled, className: "bg-default-200" },
           ]}
         />

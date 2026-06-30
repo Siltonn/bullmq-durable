@@ -9,6 +9,7 @@ import type {
   DurableProcessorInput,
   DurableWorkerOptions,
   RetentionOptions,
+  RetryOptions,
   StepOptions,
 } from "../types"
 import type { DurationInput } from "../utils/duration"
@@ -31,6 +32,7 @@ export interface DurableBullRootOptions {
   lockTimeout?: DurationInput
   retention?: RetentionOptions
   defaultStepOptions?: StepOptions
+  defaultRollbackRetry?: RetryOptions
   maxLogs?: number
 }
 
@@ -43,6 +45,7 @@ export interface DurableQueueRegistration {
   lockTimeout?: DurationInput
   retention?: RetentionOptions
   defaultStepOptions?: StepOptions
+  defaultRollbackRetry?: RetryOptions
   maxLogs?: number
   defaultJobOptions?: JobsOptions
 }
@@ -66,5 +69,10 @@ export interface DurableProcessorMetadata {
 
 /** Metadata attached by `@DurableProcess()`. */
 export interface DurableProcessMetadata {
+  jobName: string
+}
+
+/** Metadata attached by `@DurableFailure()`. */
+export interface DurableFailureMetadata {
   jobName: string
 }

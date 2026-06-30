@@ -83,7 +83,7 @@ export function resumeJobId(originalJobId: string, resumeSeq: number): string {
 export const INDEX_NEVER_EXPIRES = 9_999_999_999_999
 
 /** The terminal statuses that each get their own index bucket. */
-export type TerminalStatus = "completed" | "failed" | "cancelled"
+export type TerminalStatus = "completed" | "failed" | "compensation_failed" | "cancelled"
 
 /** `{prefix}:idx:active` — SET of non-terminal (running/yielded) instance ids.
  *  Bounded by in-flight work, so hydrating it in full stays cheap. */

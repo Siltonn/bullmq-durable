@@ -68,6 +68,12 @@ export function durableRoutes(ctx: BoardContext): Hono<{ Variables: CockpitVaria
     return c.json(ok)
   })
 
+  app.post("/instances/:instanceId/retry-compensation", async (c) => {
+    requirePermission(ctx, c.get("permissions"), "durable:retry")
+    await requireDurable(ctx).retryCompensation(c.req.param("instanceId"))
+    return c.json(ok)
+  })
+
   app.post("/instances/:instanceId/cancel", async (c) => {
     requirePermission(ctx, c.get("permissions"), "durable:cancel")
     await requireDurable(ctx).cancel(c.req.param("instanceId"))

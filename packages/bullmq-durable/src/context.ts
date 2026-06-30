@@ -16,11 +16,29 @@ import {
 } from "./errors"
 import type { ScheduleResumeInput } from "./scheduler"
 import type { StateStore } from "./store/state-store"
-import type { DurableContext, DurableLog, StepFn, StepOptions } from "./types"
+import type {
+  DurableContext,
+  DurableLog,
+  RetryOptions,
+  RollbackFn,
+  StepFn,
+  StepOptions,
+  StepPhase,
+} from "./types"
 import { type DurationInput, hasExplicitDurationUnit, parseDuration } from "./utils/duration"
 import { stepIdOf } from "./utils/keys"
 import { computeBackoff, resolveRetry } from "./utils/retry"
-import { cloneValue, serializeError } from "./utils/serialize"
+import { cloneValue, deserializeError, serializeError } from "./utils/serialize"
+
+/** A compensation registered by a completed step, captured during replay. */
+export interface RegisteredRollback {
+  /** The forward step's (raw) key. */
+  key: string
+  /** The forward step's checkpoint snapshot. */
+  output: unknown
+  handler: RollbackFn<unknown>
+  retry?: RetryOptions
+}
 
 /** Minimal surface used to mirror durable logs onto the BullMQ job. */
 export interface JobLogSink {
@@ -52,6 +70,25 @@ export class DurableContextImpl implements DurableContext {
    */
   private pendingResume?: ScheduleResumeInput
 
+  /**
+   * The lifecycle phase of the steps being run right now. The runtime flips this
+   * to drive compensation / failure-handling against the same context. Storage
+   * keys for non-`main` phases are namespaced so they never collide with the
+   * forward run (see {@link storageKey}).
+   */
+  private phase: StepPhase = "main"
+
+  /**
+   * Compensations registered by completed steps during this tick's replay, in
+   * call order. Only the in-memory closures here are runnable — the store keeps
+   * step state/output, not functions — so compensation must run on the tick that
+   * replayed them. See the runtime's failure sequence.
+   */
+  private readonly rollbacks: RegisteredRollback[] = []
+
+  /** The (raw) key of the main-phase step whose failure triggered terminal-ness. */
+  private failedStepKey?: string
+
   constructor(private readonly deps: DurableContextDeps) {
     this.instanceId = deps.instanceId
     this.runCount = deps.runCount
@@ -64,30 +101,76 @@ export class DurableContextImpl implements DurableContext {
     return resume
   }
 
+  /** Switch the active phase. Used by the runtime to drive compensation/failure. */
+  setPhase(phase: StepPhase): void {
+    this.phase = phase
+  }
+
+  /** Compensations registered so far (call order), snapshotted for the runtime. */
+  takeRollbacks(): RegisteredRollback[] {
+    return [...this.rollbacks]
+  }
+
+  /** The main-phase step whose failure triggered the terminal sequence, if any. */
+  get lastFailedStep(): string | undefined {
+    return this.failedStepKey
+  }
+
+  /** Namespace a step key by phase so compensation/failure never collide with main. */
+  private storageKey(key: string): string {
+    if (this.phase === "compensation") return `__rollback__:${key}`
+    if (this.phase === "failure") return `__failure__:${key}`
+    return key
+  }
+
+  /** Record a completed step's `onRollback` closure (main phase only). */
+  private registerRollback(key: string, output: unknown, options: StepOptions<any>): void {
+    if (this.phase !== "main" || !options.onRollback) return
+    const onRb = options.onRollback
+    const handler = (typeof onRb === "function" ? onRb : onRb.handler) as RollbackFn<unknown>
+    const retry = typeof onRb === "function" ? undefined : onRb.retry
+    this.rollbacks.push({ key, output, handler, retry })
+  }
+
   // -- Steps ---------------------------------------------------------------
 
   step<T>(key: string, fn: StepFn<T>): Promise<T>
-  step<T>(key: string, options: StepOptions, fn: StepFn<T>): Promise<T>
+  step<T>(key: string, options: StepOptions<T>, fn: StepFn<T>): Promise<T>
   async step<T>(
     key: string,
-    optionsOrFn: StepOptions | StepFn<T>,
+    optionsOrFn: StepOptions<T> | StepFn<T>,
     maybeFn?: StepFn<T>,
   ): Promise<T> {
     const { options, fn } = normalizeStepArgs<T>(optionsOrFn, maybeFn)
     await this.assertNotCancelled()
 
-    const existing = await this.deps.store.getStep(this.instanceId, key)
+    const storeKey = this.storageKey(key)
+    const existing = await this.deps.store.getStep(this.instanceId, storeKey)
     if (existing?.status === "completed") {
-      // Replay: return the checkpointed result without re-running the body.
+      // Replay: return the checkpointed result without re-running the body. The
+      // rollback closure is re-registered from the CURRENT code's options.
+      this.registerRollback(key, existing.result, options)
       return existing.result as T
+    }
+    if (existing?.status === "failed") {
+      // A terminally-failed step replays its error WITHOUT re-running the body —
+      // symmetric with a completed step replaying its result. This stops a failed
+      // step's side effect from re-firing on every compensation resume, and makes
+      // the forward-vs-compensation split deterministic (see runtime §6.8).
+      if (this.phase === "main") this.failedStepKey = key
+      throw deserializeError(existing.error ?? { name: "Error", message: `Step "${key}" failed` })
     }
 
     const attempts = (existing?.attempts ?? 0) + 1
     const startedAt = existing?.startedAt ?? Date.now()
+    // `seq` is allocated once, at the step's first persist, and reused on replay.
+    const seq = existing?.seq ?? (await this.deps.store.nextStepSeq(this.instanceId))
 
-    await this.deps.store.saveStep(this.instanceId, key, {
+    await this.deps.store.saveStep(this.instanceId, storeKey, {
       key,
       type: "step",
+      phase: this.phase,
+      seq,
       status: "running",
       attempts,
       startedAt,
@@ -100,18 +183,21 @@ export class DurableContextImpl implements DurableContext {
       // turns Dates into strings, drops `undefined`, etc. Returning the live value
       // here would let code work on the first tick and crash on resume.
       const checkpointed = cloneValue(result)
-      await this.deps.store.saveStep(this.instanceId, key, {
+      await this.deps.store.saveStep(this.instanceId, storeKey, {
         key,
         type: "step",
+        phase: this.phase,
+        seq,
         status: "completed",
         result: checkpointed,
         attempts,
         startedAt,
         completedAt: Date.now(),
       })
+      this.registerRollback(key, checkpointed, options)
       return checkpointed
     } catch (error) {
-      return await this.handleStepError<T>(key, error, options, attempts, startedAt)
+      return await this.handleStepError<T>(key, storeKey, seq, error, options, attempts, startedAt)
     }
   }
 
@@ -121,8 +207,10 @@ export class DurableContextImpl implements DurableContext {
    */
   private async handleStepError<T>(
     key: string,
+    storeKey: string,
+    seq: number,
     error: unknown,
-    options: StepOptions,
+    options: StepOptions<any>,
     attempts: number,
     startedAt: number,
   ): Promise<T> {
@@ -133,7 +221,7 @@ export class DurableContextImpl implements DurableContext {
 
     // Non-retryable: fail the whole instance immediately.
     if (error instanceof DurableNonRetryableError) {
-      await this.failStep(key, error, attempts, startedAt)
+      await this.failStep(key, storeKey, seq, error, attempts, startedAt)
       throw error
     }
 
@@ -155,9 +243,11 @@ export class DurableContextImpl implements DurableContext {
           ? error.delayMs
           : computeBackoff(retry, attempts)
 
-      await this.deps.store.saveStep(this.instanceId, key, {
+      await this.deps.store.saveStep(this.instanceId, storeKey, {
         key,
         type: "step",
+        phase: this.phase,
+        seq,
         // Stays "running": the step is mid-flight and will resume. We only
         // record an `error` for genuine failures, not expected retry-later.
         status: "running",
@@ -172,7 +262,7 @@ export class DurableContextImpl implements DurableContext {
     }
 
     // Retry budget exhausted.
-    await this.failStep(key, error, attempts, startedAt)
+    await this.failStep(key, storeKey, seq, error, attempts, startedAt)
     if (isRetryLater) {
       throw new DurableRetriesExhaustedError(key, attempts, serializeError(error))
     }
@@ -181,13 +271,20 @@ export class DurableContextImpl implements DurableContext {
 
   private async failStep(
     key: string,
+    storeKey: string,
+    seq: number,
     error: unknown,
     attempts: number,
     startedAt: number,
   ): Promise<void> {
-    await this.deps.store.saveStep(this.instanceId, key, {
+    // Record which forward step triggered the terminal sequence so the runtime
+    // can surface it in `DurableFailureInfo.failedStep`.
+    if (this.phase === "main") this.failedStepKey = key
+    await this.deps.store.saveStep(this.instanceId, storeKey, {
       key,
       type: "step",
+      phase: this.phase,
+      seq,
       status: "failed",
       error: serializeError(error),
       attempts,
@@ -210,17 +307,21 @@ export class DurableContextImpl implements DurableContext {
   private async sleepFor(key: string, delayMs: number): Promise<void> {
     await this.assertNotCancelled()
 
-    const existing = await this.deps.store.getStep(this.instanceId, key)
+    const storeKey = this.storageKey(key)
+    const existing = await this.deps.store.getStep(this.instanceId, storeKey)
     if (existing?.status === "completed") {
       // Replay: the sleep already elapsed, fall through.
       return
     }
 
     const now = Date.now()
+    const seq = existing?.seq ?? (await this.deps.store.nextStepSeq(this.instanceId))
     // A sleep is recorded as a completed step so the resume tick skips past it.
-    await this.deps.store.saveStep(this.instanceId, key, {
+    await this.deps.store.saveStep(this.instanceId, storeKey, {
       key,
       type: "sleep",
+      phase: this.phase,
+      seq,
       status: "completed",
       attempts: 1,
       result: { resumeAt: now + Math.max(0, delayMs) },
@@ -316,9 +417,9 @@ export class DurableContextImpl implements DurableContext {
 
 /** Disambiguate the `step(key, fn)` and `step(key, options, fn)` overloads. */
 function normalizeStepArgs<T>(
-  optionsOrFn: StepOptions | StepFn<T>,
+  optionsOrFn: StepOptions<any> | StepFn<T>,
   maybeFn?: StepFn<T>,
-): { options: StepOptions; fn: StepFn<T> } {
+): { options: StepOptions<any>; fn: StepFn<T> } {
   if (typeof optionsOrFn === "function") {
     return { options: {}, fn: optionsOrFn }
   }

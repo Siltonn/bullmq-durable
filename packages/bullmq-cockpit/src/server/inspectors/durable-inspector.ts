@@ -67,10 +67,10 @@ export interface DurableInspectorDeps {
 }
 
 /** Statuses whose derived view depends on their steps. */
-const STEP_HUNGRY = new Set(["running", "yielded", "failed"])
+const STEP_HUNGRY = new Set(["running", "yielded", "compensating", "failed", "compensation_failed"])
 
 /** The terminal statuses, in their fixed index-bucket order. */
-const TERMINAL_STATUSES = ["completed", "failed", "cancelled"] as const
+const TERMINAL_STATUSES = ["completed", "failed", "compensation_failed", "cancelled"] as const
 
 /** Max ids loaded per terminal bucket when listing. Pagination beyond this
  *  window is reported as `truncated` — the list never falls back to a full scan. */
@@ -82,8 +82,10 @@ const EMPTY_COUNTS = {
   sleeping: 0,
   retrying: 0,
   waiting: 0,
+  compensating: 0,
   completed: 0,
   failed: 0,
+  compensation_failed: 0,
   cancelled: 0,
   stuck: 0,
   total: 0,
@@ -159,7 +161,11 @@ export class DurableInspector {
     windowed: boolean
   }> {
     const status = query.status
-    const isTerminal = status === "completed" || status === "failed" || status === "cancelled"
+    const isTerminal =
+      status === "completed" ||
+      status === "failed" ||
+      status === "compensation_failed" ||
+      status === "cancelled"
     let wantActive: boolean
     let buckets: readonly TerminalStatus[]
     if (query.stuckOnly) {
@@ -404,6 +410,49 @@ export class DurableInspector {
     await this.reactivate(instanceId)
     await this.enqueueResume(instance, 0)
     await this.appendCockpitLog(instanceId, "Retry requested from cockpit", { action: "retry" })
+  }
+
+  /**
+   * Re-drive a `compensation_failed` instance's compensation: reset the steps
+   * whose compensation/settlement permanently failed (so they re-run), put the
+   * instance back into the `compensating` phase, and enqueue a resume. Already
+   * succeeded compensations stay completed (cache hits), so only the failed ones
+   * are retried — safe because compensations are idempotent.
+   */
+  async retryCompensation(instanceId: string): Promise<void> {
+    const instance = await this.requireInstance(instanceId)
+    if (instance.status !== "compensation_failed") {
+      throw badRequest("Retry compensation only applies to compensation_failed instances")
+    }
+
+    // Find the failed internal (compensation/failure) steps to reset.
+    const stepsHash = await this.redis.hgetall(stepsKey(this.prefix, instanceId))
+    const failedInternal = Object.entries(stepsHash)
+      .filter(([, raw]) => {
+        const s = parseStep(raw)
+        return (
+          s !== null &&
+          (s.phase === "compensation" || s.phase === "failure") &&
+          s.status === "failed"
+        )
+      })
+      .map(([field]) => field)
+
+    const [inst, steps, logs] = this.instanceKeys(instanceId)
+    const m = this.redis.multi()
+    if (failedInternal.length > 0) m.hdel(stepsKey(this.prefix, instanceId), ...failedInternal)
+    // Back to compensating + the active set; drop the terminal error/report/TTL.
+    // `failureError` / `failedStep` are kept so the resumed sequence matches the original.
+    m.hdel(inst, "error", "failedAt", "compensation")
+    m.hset(inst, "status", "compensating", "updatedAt", String(Date.now()))
+    m.sadd(activeIndexKey(this.prefix), instanceId)
+    for (const st of TERMINAL_STATUSES) m.zrem(terminalIndexKey(this.prefix, st), instanceId)
+    await m.persist(inst).persist(steps).persist(logs).exec()
+
+    await this.enqueueResume(instance, 0)
+    await this.appendCockpitLog(instanceId, "Retry compensation requested from cockpit", {
+      action: "retry-compensation",
+    })
   }
 
   async cancel(instanceId: string): Promise<void> {

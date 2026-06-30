@@ -42,7 +42,7 @@ const DEFAULT_MAX_LOGS = 1000
 // already existed (so the caller reads the stored state instead).
 //
 // KEYS: [1] instance hash, [2] idx:active, [3] idx:done:completed,
-//       [4] idx:done:failed, [5] idx:done:cancelled.
+//       [4] idx:done:failed, [5] idx:done:cancelled, [6] idx:done:compensation_failed.
 // ARGV: [1] instance id, [2..] HSET field pairs.
 // New instances start `running` (non-terminal), so they join the active set in
 // the same atomic step as the hash write — the index can never drift from state.
@@ -58,6 +58,7 @@ redis.call('HSET', KEYS[1], unpack(ARGV, 2))
 redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call('ZREM', KEYS[4], ARGV[1])
 redis.call('ZREM', KEYS[5], ARGV[1])
+redis.call('ZREM', KEYS[6], ARGV[1])
 redis.call('SADD', KEYS[2], ARGV[1])
 return 1
 `
@@ -68,14 +69,14 @@ return 1
 // in-memory store, which no-ops on a missing record.
 //
 // KEYS: [1] instance hash, [2] idx:active, [3] idx:done:completed,
-//       [4] idx:done:failed, [5] idx:done:cancelled.
+//       [4] idx:done:failed, [5] idx:done:cancelled, [6] idx:done:compensation_failed.
 // ARGV: [1] instance id, [2] new status ('' when the patch doesn't change it),
 //       [3] terminal score (INDEX_NEVER_EXPIRES — re-scored later by retention),
 //       [4..] HSET field pairs.
 // The index is maintained ONLY on a real status transition, atomically with the
 // patch: terminal statuses leave the active set and enter their done-bucket;
-// running<->yielded stays active (SADD is idempotent, covering the backfill case
-// where an in-flight instance wasn't yet indexed).
+// running/yielded/compensating stays active (SADD is idempotent, covering the
+// backfill case where an in-flight instance wasn't yet indexed).
 const UPDATE_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 0
@@ -90,6 +91,8 @@ if new ~= '' and new ~= old then
     redis.call('SREM', KEYS[2], ARGV[1]); redis.call('ZADD', KEYS[4], ARGV[3], ARGV[1])
   elseif new == 'cancelled' then
     redis.call('SREM', KEYS[2], ARGV[1]); redis.call('ZADD', KEYS[5], ARGV[3], ARGV[1])
+  elseif new == 'compensation_failed' then
+    redis.call('SREM', KEYS[2], ARGV[1]); redis.call('ZADD', KEYS[6], ARGV[3], ARGV[1])
   else
     redis.call('SADD', KEYS[2], ARGV[1])
   end
@@ -129,7 +132,7 @@ return 1
 // library-only deployment (no dashboard) never leaks index entries.
 //
 // KEYS: [1] instance, [2] steps, [3] logs, [4] done:completed, [5] done:failed,
-//       [6] done:cancelled.
+//       [6] done:cancelled, [7] done:compensation_failed.
 // ARGV: [1] ttlMs, [2] expiry score (now + ttlMs), [3] instance id, [4] now.
 const EXPIRE_SCRIPT = `
 redis.call('PEXPIRE', KEYS[1], ARGV[1])
@@ -145,6 +148,9 @@ elseif s == 'failed' then
 elseif s == 'cancelled' then
   redis.call('ZADD', KEYS[6], ARGV[2], ARGV[3])
   redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', ARGV[4])
+elseif s == 'compensation_failed' then
+  redis.call('ZADD', KEYS[7], ARGV[2], ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[7], '-inf', ARGV[4])
 end
 return 1
 `
@@ -183,10 +189,10 @@ export class RedisStateStore implements StateStore {
 
     // Register the Lua helpers as cached, named commands. The key counts must
     // match each script's KEYS arity (see the script comments above).
-    this.redis.defineCommand("durableInit", { numberOfKeys: 5, lua: INIT_SCRIPT })
-    this.redis.defineCommand("durableUpdate", { numberOfKeys: 5, lua: UPDATE_SCRIPT })
+    this.redis.defineCommand("durableInit", { numberOfKeys: 6, lua: INIT_SCRIPT })
+    this.redis.defineCommand("durableUpdate", { numberOfKeys: 6, lua: UPDATE_SCRIPT })
     this.redis.defineCommand("durableTerminal", { numberOfKeys: 5, lua: TERMINAL_SCRIPT })
-    this.redis.defineCommand("durableExpire", { numberOfKeys: 6, lua: EXPIRE_SCRIPT })
+    this.redis.defineCommand("durableExpire", { numberOfKeys: 7, lua: EXPIRE_SCRIPT })
     this.redis.defineCommand("durableLockAcquire", { numberOfKeys: 1, lua: LOCK_ACQUIRE_SCRIPT })
     this.redis.defineCommand("durableLockRenew", { numberOfKeys: 1, lua: LOCK_RENEW_SCRIPT })
     this.redis.defineCommand("durableLockRelease", { numberOfKeys: 1, lua: LOCK_RELEASE_SCRIPT })
@@ -215,6 +221,7 @@ export class RedisStateStore implements StateStore {
       this.terminalKey("completed"),
       this.terminalKey("failed"),
       this.terminalKey("cancelled"),
+      this.terminalKey("compensation_failed"),
       input.instanceId,
       ...encodeInstanceFields(instance),
     )) as number
@@ -248,6 +255,7 @@ export class RedisStateStore implements StateStore {
       this.terminalKey("completed"),
       this.terminalKey("failed"),
       this.terminalKey("cancelled"),
+      this.terminalKey("compensation_failed"),
       instanceId,
       patch.status ?? "",
       String(INDEX_NEVER_EXPIRES),
@@ -273,6 +281,20 @@ export class RedisStateStore implements StateStore {
       instanceId,
       "failed",
       { status: "failed", error: serializeError(error), failedAt: now, updatedAt: now },
+      ttlMs,
+    )
+  }
+
+  async compensationFailedInstance(
+    instanceId: string,
+    error: unknown,
+    ttlMs?: number,
+  ): Promise<void> {
+    const now = Date.now()
+    await this.terminalTransition(
+      instanceId,
+      "compensation_failed",
+      { status: "compensation_failed", error: serializeError(error), failedAt: now, updatedAt: now },
       ttlMs,
     )
   }
@@ -329,6 +351,17 @@ export class RedisStateStore implements StateStore {
       .hset(key, "updatedAt", String(Date.now()))
       .exec()
     // ioredis returns an array of `[error, result]` tuples, one per command.
+    const value = results?.[0]?.[1]
+    return typeof value === "number" ? value : Number(value ?? 0)
+  }
+
+  async nextStepSeq(instanceId: string): Promise<number> {
+    const key = this.instanceKey(instanceId)
+    const results = await this.redis
+      .multi()
+      .hincrby(key, "stepSeq", 1)
+      .hset(key, "updatedAt", String(Date.now()))
+      .exec()
     const value = results?.[0]?.[1]
     return typeof value === "number" ? value : Number(value ?? 0)
   }
@@ -417,6 +450,7 @@ export class RedisStateStore implements StateStore {
       this.terminalKey("completed"),
       this.terminalKey("failed"),
       this.terminalKey("cancelled"),
+      this.terminalKey("compensation_failed"),
       String(ttlMs),
       String(now + ttlMs),
       instanceId,
@@ -500,8 +534,10 @@ function encodeInstanceFields(patch: Partial<InstanceState>): string[] {
   str("jobName", patch.jobName)
   str("originalJobId", patch.originalJobId)
   str("status", patch.status)
+  str("failedStep", patch.failedStep)
   num("runCount", patch.runCount)
   num("resumeSeq", patch.resumeSeq)
+  num("stepSeq", patch.stepSeq)
   num("createdAt", patch.createdAt)
   num("updatedAt", patch.updatedAt)
   num("completedAt", patch.completedAt)
@@ -514,6 +550,8 @@ function encodeInstanceFields(patch: Partial<InstanceState>): string[] {
     out.push("output", JSON.stringify(patch.output))
   }
   if (patch.error !== undefined) out.push("error", JSON.stringify(patch.error))
+  if (patch.failureError !== undefined) out.push("failureError", JSON.stringify(patch.failureError))
+  if (patch.compensation !== undefined) out.push("compensation", JSON.stringify(patch.compensation))
 
   return out
 }
@@ -529,8 +567,12 @@ function parseInstance(hash: Record<string, string>): InstanceState {
     input: hash.input !== undefined ? JSON.parse(hash.input) : undefined,
     output: hash.output !== undefined ? JSON.parse(hash.output) : undefined,
     error: hash.error !== undefined ? JSON.parse(hash.error) : undefined,
+    failureError: hash.failureError !== undefined ? JSON.parse(hash.failureError) : undefined,
+    failedStep: hash.failedStep,
+    compensation: hash.compensation !== undefined ? JSON.parse(hash.compensation) : undefined,
     runCount: toInt(hash.runCount) ?? 0,
     resumeSeq: toInt(hash.resumeSeq) ?? 0,
+    stepSeq: toInt(hash.stepSeq),
     createdAt: toInt(hash.createdAt) ?? 0,
     updatedAt: toInt(hash.updatedAt) ?? 0,
     completedAt: toInt(hash.completedAt),

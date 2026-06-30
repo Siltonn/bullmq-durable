@@ -100,6 +100,24 @@ export class MemoryStateStore implements StateStore {
     if (ttlMs !== undefined) record.expiresAt = now + ttlMs
   }
 
+  async compensationFailedInstance(
+    instanceId: string,
+    error: unknown,
+    ttlMs?: number,
+  ): Promise<void> {
+    const record = this.live(instanceId)
+    if (!record) return
+    const now = Date.now()
+    record.instance = {
+      ...record.instance,
+      status: "compensation_failed",
+      error: serializeError(error),
+      failedAt: now,
+      updatedAt: now,
+    }
+    if (ttlMs !== undefined) record.expiresAt = now + ttlMs
+  }
+
   async cancelInstance(instanceId: string, ttlMs?: number): Promise<void> {
     const record = this.live(instanceId)
     if (!record) return
@@ -114,6 +132,14 @@ export class MemoryStateStore implements StateStore {
     record.instance.resumeSeq += 1
     record.instance.updatedAt = Date.now()
     return record.instance.resumeSeq
+  }
+
+  async nextStepSeq(instanceId: string): Promise<number> {
+    const record = this.live(instanceId)
+    if (!record) return 0
+    record.instance.stepSeq = (record.instance.stepSeq ?? 0) + 1
+    record.instance.updatedAt = Date.now()
+    return record.instance.stepSeq
   }
 
   // -- Steps ---------------------------------------------------------------

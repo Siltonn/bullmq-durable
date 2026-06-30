@@ -114,6 +114,17 @@ export function DurableInstancePanel({
     )
       action.mutate(() => api.durableRetry(instanceId))
   }
+  const doRetryCompensation = async () => {
+    if (
+      await confirm({
+        title: "Retry compensation?",
+        body: "Re-runs the compensations that failed. Already-rolled-back steps stay cached.",
+        confirmLabel: "Retry compensation",
+        confirmColor: "warning",
+      })
+    )
+      action.mutate(() => api.durableRetryCompensation(instanceId))
+  }
   const doCancel = async () => {
     if (
       await confirm({
@@ -173,6 +184,18 @@ export function DurableInstancePanel({
           Retry
         </Button>
       )}
+      {can("durable:retry") && data.status === "compensation_failed" && (
+        <Button
+          size="md"
+          color="danger"
+          variant="flat"
+          startContent={<CockpitIcon name="rollback" width={15} />}
+          isLoading={action.isPending}
+          onPress={doRetryCompensation}
+        >
+          Retry compensation
+        </Button>
+      )}
       {can("durable:cancel") && (yielded || running) && (
         <Button
           size="md"
@@ -198,9 +221,35 @@ export function DurableInstancePanel({
     </>
   )
 
+  const compFailed = data.status === "compensation_failed" ? data.compensation?.failed ?? [] : []
+
   return (
     <div className="flex flex-col gap-5">
       <InstanceHeader instance={data} actions={actions} />
+
+      {data.status === "compensation_failed" && (
+        <div className="rounded-medium border border-danger-200 bg-danger-50/60 p-3 text-sm dark:bg-danger-50/10">
+          <div className="flex items-center gap-2 font-semibold text-danger">
+            <CockpitIcon name="compensationFailed" width={16} />
+            Compensation failed — manual intervention needed
+          </div>
+          <div className="mt-1 text-foreground-600">
+            {compFailed.length} of {(data.compensation?.rolledBack.length ?? 0) + compFailed.length}{" "}
+            compensation(s) could not be completed. Side effects may be partially un-done. Use
+            “Retry compensation” once the cause is fixed.
+          </div>
+          {compFailed.length > 0 && (
+            <ul className="mt-2 space-y-1">
+              {compFailed.map((c) => (
+                <li key={c.key} className="text-xs text-danger">
+                  <span className="font-mono">{c.key}</span>
+                  {c.error?.message ? ` — ${c.error.message}` : ""}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       <Card shadow="none" className="glass-card">
         <CardHeader className="flex items-center justify-between pb-0">
