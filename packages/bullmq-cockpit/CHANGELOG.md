@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 It is versioned in lockstep with [`bullmq-durable`](../bullmq-durable).
 
+## [0.1.4] - 2026-06-29
+
+### Fixed
+
+- **NestJS module now runs on Fastify as well as Express**, from the same
+  `BullMQCockpitModule` — no need to fall back to the standalone
+  `bullmq-cockpit/fastify` plugin. Two platform-portability bugs are fixed: the
+  mount wildcard is now `${path}/*` (the previous `(.*)` form failed to match
+  nested dashboard routes on NestJS 10 + Express), and the request path is read
+  from `req.originalUrl` (on Fastify, Nest's bundled middie engine rewrites
+  `req.url` to the post-match remainder, which dropped the sub-path and routed
+  every request to `/`). Verified across NestJS 10/11 × Express/Fastify.
+
 ## [0.1.3] - 2026-06-29
 
 ### Added

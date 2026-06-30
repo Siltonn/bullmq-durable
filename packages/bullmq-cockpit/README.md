@@ -134,11 +134,14 @@ The cockpit's Redis connections are built lazily and released automatically on
 application shutdown (enable `app.enableShutdownHooks()` to also release them on
 `SIGTERM`/`SIGINT`).
 
-Two caveats: this module targets the **default Express platform** — on
-`@nestjs/platform-fastify`, mount [`bullmq-cockpit/fastify`](#fastify) directly.
-And because the dashboard mounts as middleware, Nest guards/interceptors don't run
-for its routes — put authorization in the `auth` hook (whose `req` is the raw
-request).
+This module runs on **both** the default Express platform and
+`@nestjs/platform-fastify` with no extra setup — Nest's Fastify platform bundles
+the middie engine, so the dashboard middleware works unchanged. (Prefer a
+standalone plugin? Mount [`bullmq-cockpit/fastify`](#fastify) directly instead.)
+
+One caveat: because the dashboard mounts as middleware, Nest guards/interceptors
+don't run for its routes — put authorization in the `auth` hook (whose `req` is
+the raw request).
 
 ### Hono (directly)
 

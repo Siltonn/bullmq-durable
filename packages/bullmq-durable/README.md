@@ -475,8 +475,9 @@ the root defaults.
 
 For [compensation & failure handling](#8-compensation--failure-handling), add
 `onRollback` to a `ctx.step` as usual, and declare the terminal-failure handler
-with `@DurableFailure(jobName)` on a sibling method of the same `@DurableProcessor`
-— it is wired to the matching `@DurableProcess` automatically:
+with `@DurableFailure()` on a sibling method of the same `@DurableProcessor`. No
+job name is needed — like `@OnWorkerEvent('failed')`, it settles every job on the
+processor:
 
 ```ts
 @DurableProcessor("orders")
@@ -486,8 +487,8 @@ export class CheckoutProcessor {
     /* … steps with onRollback … */
   }
 
-  @DurableFailure("checkout")
-  async onCheckoutFailed(
+  @DurableFailure()
+  async onFailed(
     job: DurableJob<CheckoutInput, Receipt>,
     ctx: DurableContext,
     failure: DurableFailureInfo,
@@ -496,6 +497,11 @@ export class CheckoutProcessor {
   }
 }
 ```
+
+A processor declares at most one `@DurableFailure()`; it settles every job on the
+queue, so branch on `job.name` inside if a multi-job processor needs to. For
+finer control, the core worker API still accepts a per-job
+`{ run, onFailure }` handler.
 
 See [`examples/nestjs`](./examples/nestjs).
 

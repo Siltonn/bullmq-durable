@@ -11,7 +11,7 @@ import type { BoardPermission, BoardUser } from "../shared/dto"
 import { DEFAULT_DURABLE_PREFIX } from "./durable/protocol"
 
 /** The cockpit's own version string, surfaced in the UI footer. */
-export const COCKPIT_VERSION = "0.1.2"
+export const COCKPIT_VERSION = "0.1.4"
 
 /** Default "stale" threshold for stuck detection: 5 minutes. */
 export const DEFAULT_STUCK_THRESHOLD_MS = 5 * 60 * 1000

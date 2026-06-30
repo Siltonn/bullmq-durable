@@ -21,7 +21,6 @@ export {
 export type {
   DurableBullRootAsyncOptions,
   DurableBullRootOptions,
-  DurableFailureMetadata,
   DurableInjectionToken,
   DurableProcessMetadata,
   DurableProcessorMetadata,

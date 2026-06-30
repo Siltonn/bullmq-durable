@@ -21,10 +21,11 @@
  *   })
  *   export class AdminModule {}
  *
- * It depends only on `@nestjs/common` (an optional peer) and the default Express
- * platform; the cockpit core never imports Nest. Because the cockpit is mounted as
- * middleware (not via app.use mounting), the base path is passed explicitly (as
- * `path`) so the bridge can strip it from `req.url`.
+ * It depends only on `@nestjs/common` (an optional peer); the cockpit core never
+ * imports Nest. The cockpit is mounted as Nest middleware, which runs on **both**
+ * the Express and Fastify platforms unchanged — `@nestjs/platform-fastify` bundles
+ * and auto-registers its middie engine, so no extra setup is needed. The base path
+ * is passed explicitly (as `path`) so the bridge can strip it from the request URL.
  *
  * The cockpit app (and its Redis connections) is built lazily inside a DI factory
  * — not at module-definition time — and released on application shutdown.
@@ -34,14 +35,17 @@
  * never auto-discovers by scanning Redis — it shows exactly what you register.
  *
  * Caveats:
- *  - **Platform**: the wildcard route (`${path}/(.*)`) and raw `IncomingMessage`/
- *    `ServerResponse` plumbing assume the **default Express platform**. On
- *    `@nestjs/platform-fastify`, register the Fastify adapter
- *    (`bullmq-cockpit/fastify`) directly instead of this module.
+ *  - **Platform**: works on the default Express platform *and* on
+ *    `@nestjs/platform-fastify` with no configuration. The one platform quirk is
+ *    handled internally: on Fastify the bundled middie engine rewrites `req.url`
+ *    to the post-match remainder, so the full path is read from `req.originalUrl`
+ *    (which both Express and middie populate). You can still mount the standalone
+ *    `bullmq-cockpit/fastify` plugin directly if you prefer.
  *  - **Auth**: this is mounted as middleware, so Nest guards/interceptors do NOT
  *    run for cockpit routes — do authorization inside the `auth` hook. Its `req`
- *    is the raw (Express) request, so only data attached by middleware that ran
- *    earlier (e.g. session/passport) is visible as `req.user`.
+ *    is the raw Node request (an Express `req`, or the raw `IncomingMessage` on
+ *    Fastify), so only data attached by middleware that ran earlier (e.g.
+ *    session/passport) is visible as `req.user`.
  */
 
 import { Inject, Injectable, Module, RequestMethod } from "@nestjs/common"
@@ -213,7 +217,12 @@ export class BullMQCockpitModule implements NestModule, OnApplicationShutdown {
       next: (err?: unknown) => void,
     ): Promise<void> => {
       try {
-        const fullPath = req.url ?? "/"
+        // Express leaves the full URL on `req.url`, but on Fastify the platform's
+        // bundled middie engine rewrites `req.url` to the post-match remainder
+        // (dropping the matched sub-path). `originalUrl` carries the full,
+        // un-stripped path on both platforms — strip our own mount base from it.
+        const fullPath =
+          (req as IncomingMessage & { originalUrl?: string }).originalUrl ?? req.url ?? "/"
         const stripped =
           path && fullPath.startsWith(path) ? fullPath.slice(path.length) || "/" : fullPath
         const body = await readNodeBody(req)
@@ -225,11 +234,15 @@ export class BullMQCockpitModule implements NestModule, OnApplicationShutdown {
       }
     }
 
+    // `${path}/*` is the one wildcard token that matches deep sub-paths across
+    // every supported combination: Express and Fastify, on both NestJS 10
+    // (path-to-regexp 0.x) and 11 (path-to-regexp 8.x). The older `(.*)` form
+    // silently fails to match nested paths on NestJS 10 + Express.
     consumer
       .apply(middleware)
       .forRoutes(
         { path: path || "/", method: RequestMethod.ALL },
-        { path: `${path}/(.*)`, method: RequestMethod.ALL },
+        { path: `${path}/*`, method: RequestMethod.ALL },
       )
   }
 

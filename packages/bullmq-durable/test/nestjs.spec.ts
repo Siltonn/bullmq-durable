@@ -44,10 +44,10 @@ class GenerationProcessor {
     return "image"
   }
 
-  // A sibling @DurableFailure is wired as the job's onFailure settlement.
-  @DurableFailure("video")
-  async onVideoFailure(): Promise<void> {
-    this.calls.push("video-failure")
+  // The processor's single terminal-failure handler — settles every job.
+  @DurableFailure()
+  async onFailure(): Promise<void> {
+    this.calls.push("failure")
   }
 
   // A method without the decorator must be ignored by discovery.
@@ -75,16 +75,19 @@ class MediaProcessor extends BaseMediaProcessor {
   }
 }
 
-// A processor whose @DurableFailure job name has no matching @DurableProcess.
-@DurableProcessor("orphan")
-class OrphanFailureProcessor {
-  @DurableProcess("real")
-  async real(): Promise<string> {
-    return "real"
+// A processor that declares two @DurableFailure() handlers (ambiguous).
+@DurableProcessor("ambiguous")
+class AmbiguousFailureProcessor {
+  @DurableProcess("a")
+  async a(): Promise<string> {
+    return "a"
   }
 
-  @DurableFailure("typo") // no @DurableProcess("typo") — a developer typo
-  async onTypoFailure(): Promise<void> {}
+  @DurableFailure()
+  async first(): Promise<void> {}
+
+  @DurableFailure()
+  async second(): Promise<void> {}
 }
 
 // ---------------------------------------------------------------------------
@@ -153,26 +156,25 @@ describe("DurableExplorer", () => {
     expect(created[0]?.options.retention).toEqual({ completed: "7d" })
     expect(created[0]?.options.connection).toBe(CONNECTION)
 
-    // Handlers are bound to the instance, wrapped as `{ run, onFailure? }`.
-    const videoHandler = created[0]!.processor.video as {
-      run: () => Promise<string>
-      onFailure?: () => Promise<void>
-    }
+    // Handlers are bound to the instance, wrapped as `{ run }`.
+    const videoHandler = created[0]!.processor.video as { run: () => Promise<string> }
     await videoHandler.run()
     expect(instance.calls).toContain("video")
 
-    // The sibling @DurableFailure is wired as the job's onFailure handler.
-    expect(typeof videoHandler.onFailure).toBe("function")
-    await videoHandler.onFailure!()
-    expect(instance.calls).toContain("video-failure")
-    // A job without @DurableFailure has no onFailure.
+    // @DurableFailure() is the worker-wide settlement, not attached per job...
+    expect((created[0]!.processor.video as { onFailure?: unknown }).onFailure).toBeUndefined()
     expect((created[0]!.processor.image as { onFailure?: unknown }).onFailure).toBeUndefined()
+
+    // ...it is handed to the worker as options.onFailure, bound to the instance.
+    expect(typeof created[0]!.options.onFailure).toBe("function")
+    await created[0]!.options.onFailure()
+    expect(instance.calls).toContain("failure")
 
     await explorer.onModuleDestroy()
   })
 
-  it("throws when a @DurableFailure has no matching @DurableProcess", () => {
-    const instance = new OrphanFailureProcessor()
+  it("throws when a processor declares more than one @DurableFailure()", () => {
+    const instance = new AmbiguousFailureProcessor()
     const factory: DurableWorkerFactory = () => ({ close: async () => undefined })
     const discovery = { getProviders: () => [{ instance }] }
     const moduleRef = {
@@ -185,7 +187,7 @@ describe("DurableExplorer", () => {
       moduleRef as never,
       factory,
     )
-    expect(() => explorer.onModuleInit()).toThrow(/no matching\s+@DurableProcess/)
+    expect(() => explorer.onModuleInit()).toThrow(/at most one/)
   })
 
   it("discovers @DurableProcess methods inherited from a base class", () => {
