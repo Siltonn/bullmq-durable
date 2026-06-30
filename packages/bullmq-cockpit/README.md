@@ -55,8 +55,9 @@ npx bullmq-cockpit --redis redis://localhost:6379 --queues generation,emails --p
 # → open http://localhost:3001
 ```
 
-The CLI auto-discovers queues if `--queues` is omitted. Run `bullmq-cockpit --help`
-for every flag (`--base-path`, `--readonly`, `--no-durable`, …).
+The CLI auto-discovers queues if `--queues` is omitted (scanned once at startup,
+then cached — restart to pick up new queues). Run `bullmq-cockpit --help` for
+every flag (`--base-path`, `--readonly`, `--no-durable`, …).
 
 ## Embedding
 

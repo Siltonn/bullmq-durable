@@ -66,10 +66,38 @@ export function onlyJobs(jobs: (Job | undefined)[]): Job[] {
   return jobs.filter((j): j is Job => Boolean(j))
 }
 
+/**
+ * Auto-discovery is cached per board context. The `deps` object is built once
+ * (in `createBoardContext`) and shared by every inspector, so keying off it
+ * scans Redis exactly once per process: the first auto-discover does the SCAN,
+ * and every later call — across inspectors, requests, and the background alert
+ * scheduler — reuses that result. Caching the *promise* also collapses
+ * concurrent first callers into a single scan. A `WeakMap` keeps the cache
+ * per-context (isolated across tests, GC'd with the context).
+ *
+ * The trade: queues created after startup won't appear until the process
+ * restarts. That's deliberate — re-scanning a (possibly shared, production)
+ * keyspace on every request is the real performance risk, and an admin board's
+ * queue set is effectively static. Pass an explicit `queues` allow-list to skip
+ * discovery entirely.
+ */
+const discoveryCache = new WeakMap<BullMQInspectorDeps, Promise<string[]>>()
+
 /** Resolve the queue names this cockpit exposes (allow-list or auto-discovered). */
 export async function resolveQueueNames(deps: BullMQInspectorDeps): Promise<string[]> {
   if (deps.queues) return [...deps.queues]
-  return discoverQueues(deps.redis, deps.bullPrefix)
+  let discovered = discoveryCache.get(deps)
+  if (!discovered) {
+    discovered = discoverQueues(deps.redis, deps.bullPrefix).catch((err) => {
+      // Don't cache a failed scan — let the next call retry (e.g. Redis was
+      // briefly unreachable at boot).
+      discoveryCache.delete(deps)
+      throw err
+    })
+    discoveryCache.set(deps, discovered)
+  }
+  // Return a copy so callers can't mutate the shared cached array.
+  return [...(await discovered)]
 }
 
 /** Discover queue names by scanning BullMQ's per-queue `:meta` keys. */

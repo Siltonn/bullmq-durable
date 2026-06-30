@@ -82,8 +82,10 @@ export interface BullMQCockpitOptions {
   /** A BullMQ-compatible Redis connection (ioredis options or an instance). */
   connection: ConnectionOptions
   /**
-   * Queue names to expose. When omitted, the cockpit auto-discovers queues from
-   * Redis (by scanning BullMQ's `*:meta` keys).
+   * Queue names to expose. When omitted, the cockpit auto-discovers queues once
+   * at startup by scanning BullMQ's `*:meta` keys, then caches that set for the
+   * process lifetime (queues created later need a restart to appear). Pass this
+   * list in production to skip the scan entirely.
    */
   queues?: string[]
   /** BullMQ's key prefix (the `bull` namespace). Defaults to `"bull"`. */
