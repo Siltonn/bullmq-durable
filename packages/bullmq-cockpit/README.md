@@ -43,8 +43,9 @@ retry / resume controls, and stuck detection.
 
 **Durable** (auto-detected from `bullmq-durable` state — see [Durable inspector](#durable-inspector))
 
-- step flow diagram, sleep / retry / resume controls, synthesized event feed,
-  inline durable panel on the job page, and four-class stuck detection.
+- step flow diagram, sleep / retry / resume controls, **saga compensation**
+  (rollback timeline + retry-compensation), synthesized event feed, inline durable
+  panel on the job page, and four-class stuck detection.
 
 ---
 
@@ -194,9 +195,16 @@ derived status (the runtime's coarse `yielded` is split into `sleeping`,
 `retrying`, `waiting`). The detail view shows:
 
 - a **step timeline** (`✓ completed · 421ms`, `↻ retrying · attempt 12 · next in 8s`, …),
+  with `ROLLBACK` / `SETTLE` tags for compensation and `onFailure` steps,
 - per-step result previews, errors, and timings,
 - input / output / logs / a synthesized event feed,
 - **Resume now**, **Retry**, **Cancel**, and **Delete state** actions.
+
+**Saga compensation** (`bullmq-durable` ≥ 0.1.3) is first-class: the `compensating`
+and `compensation_failed` statuses appear in the Overview summary, status filter,
+and counts. A `compensation_failed` instance shows a "manual intervention needed"
+banner with its compensation report (what rolled back vs. failed) and a **Retry
+compensation** action that re-runs only the failed compensation steps.
 
 The **Health** page surfaces stuck instances in four classes: `running_stale`,
 `resume_missed`, `orphan_resume_job`, and `orphan_instance`.
@@ -223,7 +231,7 @@ GET  /api/alerts/channels                POST /api/alerts/channels
 POST /api/alerts/channels/:id/{remove,test}
 GET  /api/durable/instances              GET /api/durable/instances/:id
 GET  /api/durable/instances/:id/{steps,events,logs}
-POST /api/durable/instances/:id/{resume,retry,cancel,delete}
+POST /api/durable/instances/:id/{resume,retry,retry-compensation,cancel,delete}
 GET  /api/health                         GET /api/health/{redis,stuck}
 ```
 
