@@ -92,7 +92,11 @@ export function DurableSummary({
             { label: "Retrying", value: d.retrying, className: "bg-warning" },
             { label: "Compensating", value: d.compensating, className: "bg-warning/70" },
             { label: "Failed", value: d.failed, className: "bg-danger" },
-            { label: "Compensation failed", value: d.compensation_failed, className: "bg-danger/80" },
+            {
+              label: "Compensation failed",
+              value: d.compensation_failed,
+              className: "bg-danger/80",
+            },
             { label: "Cancelled", value: d.cancelled, className: "bg-default-200" },
           ]}
         />

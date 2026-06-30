@@ -110,7 +110,9 @@ describeRedis("RedisStateStore (integration)", () => {
       failedStep: "poll",
       compensation: {
         rolledBack: ["reserve"],
-        failed: [{ key: "charge", status: "failed", error: { name: "Error", message: "refund down" } }],
+        failed: [
+          { key: "charge", status: "failed", error: { name: "Error", message: "refund down" } },
+        ],
       },
     })
     expect(await admin.sismember(`${prefix}:idx:active`, id)).toBe(1)

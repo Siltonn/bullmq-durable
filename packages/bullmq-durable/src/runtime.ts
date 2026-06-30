@@ -203,10 +203,7 @@ export class DurableRuntime {
    * from any compensation/failure step suspends with the instance still
    * `compensating`, and a resume rebuilds and continues this sequence.
    */
-  private async runFailureSequence(
-    ctx: DurableContextImpl,
-    error: unknown,
-  ): Promise<RunOutcome> {
+  private async runFailureSequence(ctx: DurableContextImpl, error: unknown): Promise<RunOutcome> {
     const { store, instanceId } = this.params
 
     // Enter (or confirm) the compensating phase. Persist the triggering error +
@@ -228,7 +225,8 @@ export class DurableRuntime {
     try {
       report = await this.runRollbacks(ctx, triggerError)
     } catch (e) {
-      if (e instanceof DurableYieldError) return { type: "yielded", resume: ctx.takePendingResume() }
+      if (e instanceof DurableYieldError)
+        return { type: "yielded", resume: ctx.takePendingResume() }
       if (e instanceof DurableCancelledError) {
         await store.cancelInstance(instanceId, this.retentionMs("cancelled"))
         return { type: "cancelled" }
@@ -269,10 +267,7 @@ export class DurableRuntime {
    * suspends the whole sequence (rethrown). A genuine terminal failure of one
    * compensation is recorded and does NOT block the rest (independent undos).
    */
-  private async runRollbacks(
-    ctx: DurableContextImpl,
-    error: unknown,
-  ): Promise<CompensationReport> {
+  private async runRollbacks(ctx: DurableContextImpl, error: unknown): Promise<CompensationReport> {
     const report: CompensationReport = { rolledBack: [], failed: [] }
     const registered = ctx.takeRollbacks()
     if (registered.length === 0) return report
@@ -298,10 +293,7 @@ export class DurableRuntime {
   }
 
   /** The terminal transition, chosen by whether any compensation failed. */
-  private async settleTerminal(
-    error: unknown,
-    report: CompensationReport,
-  ): Promise<RunOutcome> {
+  private async settleTerminal(error: unknown, report: CompensationReport): Promise<RunOutcome> {
     const { store, instanceId } = this.params
     // Persist the compensation report as metadata before the terminal flip.
     if (report.rolledBack.length > 0 || report.failed.length > 0) {

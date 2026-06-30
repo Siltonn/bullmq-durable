@@ -294,7 +294,12 @@ export class RedisStateStore implements StateStore {
     await this.terminalTransition(
       instanceId,
       "compensation_failed",
-      { status: "compensation_failed", error: serializeError(error), failedAt: now, updatedAt: now },
+      {
+        status: "compensation_failed",
+        error: serializeError(error),
+        failedAt: now,
+        updatedAt: now,
+      },
       ttlMs,
     )
   }

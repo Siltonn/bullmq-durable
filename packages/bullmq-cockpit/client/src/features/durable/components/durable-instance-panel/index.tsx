@@ -221,7 +221,7 @@ export function DurableInstancePanel({
     </>
   )
 
-  const compFailed = data.status === "compensation_failed" ? data.compensation?.failed ?? [] : []
+  const compFailed = data.status === "compensation_failed" ? (data.compensation?.failed ?? []) : []
 
   return (
     <div className="flex flex-col gap-5">

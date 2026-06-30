@@ -39,7 +39,11 @@ const DURABLE_STATUS: Record<DurableDerivedStatus, StatusMeta> = {
   compensating: { label: "Compensating", color: "warning", icon: "compensating" },
   completed: { label: "Completed", color: "success", icon: "completed" },
   failed: { label: "Failed", color: "danger", icon: "failed" },
-  compensation_failed: { label: "Compensation failed", color: "danger", icon: "compensationFailed" },
+  compensation_failed: {
+    label: "Compensation failed",
+    color: "danger",
+    icon: "compensationFailed",
+  },
   cancelled: { label: "Cancelled", color: "default", icon: "cancelled" },
 }
 

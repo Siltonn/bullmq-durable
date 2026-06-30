@@ -32,11 +32,9 @@ describe("per-step compensation (onRollback)", () => {
     const engine = new TestEngine({
       job: {
         run: async (_job: DurableJob, ctx: DurableContext) => {
-          await ctx.step(
-            "reserve",
-            { onRollback: (rb) => void (seen = rb) },
-            async () => ({ chargeId: "ch_1" }),
-          )
+          await ctx.step("reserve", { onRollback: (rb) => void (seen = rb) }, async () => ({
+            chargeId: "ch_1",
+          }))
           await ctx.step("explode", async () => {
             throw new Error("downstream failed")
           })
