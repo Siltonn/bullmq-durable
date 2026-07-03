@@ -52,7 +52,8 @@ export interface JobSummary {
 }
 
 export interface JobDetail extends JobSummary {
-  data: unknown
+  /** Optional: a job whose data is `undefined` carries no `data` over JSON. */
+  data?: unknown
   returnValue?: unknown
   stacktrace?: string[]
   opts?: Record<string, unknown>

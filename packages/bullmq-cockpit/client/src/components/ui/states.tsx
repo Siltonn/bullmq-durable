@@ -1,7 +1,7 @@
 /** Empty / error / loading placeholders shared across pages. */
 
 import { Button, Spinner } from "@heroui/react"
-import { ApiError } from "@/lib/api"
+import { errorMessage } from "@/lib/api"
 import { CockpitIcon, type IconName } from "@/lib/icons"
 
 export function EmptyState({
@@ -31,12 +31,7 @@ export function LoadingState({ label = "Loading…" }: { label?: string }) {
 }
 
 export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
-  const message =
-    error instanceof ApiError
-      ? error.message
-      : error instanceof Error
-        ? error.message
-        : "Something went wrong"
+  const message = errorMessage(error)
   return (
     <div className="flex flex-col items-center justify-center gap-3 px-6 py-16 text-center">
       <CockpitIcon name="alert" width={36} className="text-danger" />

@@ -45,14 +45,17 @@ export interface CockpitVariables {
   user?: BoardUser
 }
 
-interface ResolvedAuth {
+export interface ResolvedAuth {
   allowed: boolean
   permissions: BoardPermission[]
   user?: BoardUser
 }
 
 /** Run the host auth hook and normalize its (boolean | object) result. */
-async function resolveAuth(context: BoardContext, authCtx: AuthContext): Promise<ResolvedAuth> {
+export async function resolveAuth(
+  context: BoardContext,
+  authCtx: AuthContext,
+): Promise<ResolvedAuth> {
   const result: AuthResult = await context.options.auth(authCtx)
   if (typeof result === "boolean") {
     return { allowed: result, permissions: result ? ALL_PERMISSIONS : [] }

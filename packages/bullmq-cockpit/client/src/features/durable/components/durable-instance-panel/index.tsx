@@ -13,7 +13,7 @@ import { Button, Card, CardBody, CardHeader, Tab, Tabs } from "@heroui/react"
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { useCockpitAction } from "@/lib/providers/actions"
-import { api, ApiError } from "@/lib/api"
+import { api, errorStatus } from "@/lib/api"
 import { usePermission } from "@/lib/providers/config"
 import { useConfirm } from "@/lib/providers/confirm"
 import { CockpitIcon } from "@/lib/icons"
@@ -44,7 +44,7 @@ export function DurableInstancePanel({
     queryKey: ["durableInstance", instanceId],
     queryFn: () => api.durableInstance(instanceId),
     refetchInterval: 3000,
-    retry: (count, err) => !(err instanceof ApiError && err.status === 404) && count < 1,
+    retry: (count, err) => errorStatus(err) !== 404 && count < 1,
   })
   const { data: logs } = useQuery({
     queryKey: ["durableLogs", instanceId],
@@ -73,7 +73,7 @@ export function DurableInstancePanel({
   })
 
   if (isLoading) return <LoadingState label="Loading instance…" />
-  if (error instanceof ApiError && error.status === 404) {
+  if (errorStatus(error) === 404) {
     return (
       <Card shadow="none" className="glass-card">
         <CardBody>

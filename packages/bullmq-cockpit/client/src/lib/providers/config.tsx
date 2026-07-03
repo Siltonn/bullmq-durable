@@ -9,7 +9,7 @@ import { Spinner } from "@heroui/react"
 import { useQuery } from "@tanstack/react-query"
 import { createContext, useContext, type ReactNode } from "react"
 import type { BoardPermission, CockpitConfig } from "@shared/dto"
-import { api, ApiError } from "@/lib/api"
+import { api, errorMessage, errorStatus } from "@/lib/api"
 import { CockpitIcon } from "@/lib/icons"
 
 const ConfigContext = createContext<CockpitConfig | null>(null)
@@ -56,10 +56,13 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   if (isLoading) return <CenteredSpinner label="Loading bullmq-cockpit…" />
   if (error || !data) {
-    const forbidden = error instanceof ApiError && error.status === 403
+    const status = errorStatus(error)
+    const forbidden = status === 403
+    // A tRPC error carries an HTTP status; a bare transport failure (no status)
+    // means we could not reach the server at all.
     const message =
-      error instanceof ApiError
-        ? error.message
+      status !== undefined
+        ? errorMessage(error)
         : "Could not reach the bullmq-cockpit API. Is the server running?"
     return (
       <BootError

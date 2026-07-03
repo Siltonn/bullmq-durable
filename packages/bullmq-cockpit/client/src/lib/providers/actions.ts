@@ -7,7 +7,7 @@
  */
 
 import { useMutation, useQueryClient, type QueryKey } from "@tanstack/react-query"
-import { ApiError } from "@/lib/api"
+import { errorMessage } from "@/lib/api"
 import { useToast } from "./toast"
 
 export function useCockpitAction(options: { success: string; invalidate?: QueryKey[] }) {
@@ -21,13 +21,7 @@ export function useCockpitAction(options: { success: string; invalidate?: QueryK
       options.invalidate?.forEach((key) => void queryClient.invalidateQueries({ queryKey: key }))
     },
     onError: (error: unknown) => {
-      const message =
-        error instanceof ApiError
-          ? error.message
-          : error instanceof Error
-            ? error.message
-            : "Action failed"
-      toast({ message, type: "error" })
+      toast({ message: errorMessage(error, "Action failed"), type: "error" })
     },
   })
 }
