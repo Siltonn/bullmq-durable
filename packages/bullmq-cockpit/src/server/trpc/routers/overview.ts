@@ -1,9 +1,8 @@
-/** `GET /api/overview` — the dashboard landing aggregate. */
+/** `overview` — the dashboard landing aggregate + system-wide golden signals. */
 
-import { Hono } from "hono"
-import type { JobCounts, OverviewStats, QueueSummary } from "../../shared/dto"
-import { requirePermission, type CockpitVariables } from "../middleware/auth"
-import type { BoardContext } from "../context"
+import type { JobCounts, OverviewStats, QueueSummary } from "../../../shared/dto"
+import { signalsInput } from "../inputs"
+import { protectedProcedure, router } from "../trpc"
 
 function sumCounts(all: JobCounts[]): JobCounts {
   return all.reduce<JobCounts>(
@@ -35,33 +34,28 @@ function busyness(q: QueueSummary): number {
   return q.counts.active * 3 + q.counts.waiting + q.counts.delayed + q.counts.failed * 2
 }
 
-export function overviewRoutes(ctx: BoardContext): Hono<{ Variables: CockpitVariables }> {
-  const app = new Hono<{ Variables: CockpitVariables }>()
+/** Clamp a caller-supplied window to a sane range (defaults to 30 minutes). */
+function clampWindow(windowMinutes: number | undefined): number {
+  return windowMinutes && windowMinutes > 0 ? Math.min(720, windowMinutes) : 30
+}
 
-  app.get("/", async (c) => {
-    requirePermission(ctx, c.get("permissions"), "queue:read")
-
-    const queues = await ctx.bullmq.listQueues()
-    const durable = ctx.durable ? await ctx.durable.statusCounts() : undefined
+export const overviewRouter = router({
+  stats: protectedProcedure("queue:read").query(async ({ ctx }): Promise<OverviewStats> => {
+    const queues = await ctx.board.bullmq.listQueues()
+    const durable = ctx.board.durable ? await ctx.board.durable.statusCounts() : undefined
     const topQueues = [...queues].sort((a, b) => busyness(b) - busyness(a)).slice(0, 6)
 
-    const stats: OverviewStats = {
+    return {
       queues: queues.length,
       jobs: sumCounts(queues.map((q) => q.counts)),
       durable,
       topQueues,
       generatedAt: Date.now(),
     }
-    return c.json(stats)
-  })
+  }),
 
   // System-wide golden signals (traffic / latency / errors / saturation).
-  app.get("/signals", async (c) => {
-    requirePermission(ctx, c.get("permissions"), "queue:read")
-    const window = Number(c.req.query("windowMinutes"))
-    const windowMinutes = Number.isFinite(window) && window > 0 ? Math.min(720, window) : 30
-    return c.json(await ctx.bullmq.systemSignals(windowMinutes))
-  })
-
-  return app
-}
+  signals: protectedProcedure("queue:read")
+    .input(signalsInput)
+    .query(({ ctx, input }) => ctx.board.bullmq.systemSignals(clampWindow(input.windowMinutes))),
+})

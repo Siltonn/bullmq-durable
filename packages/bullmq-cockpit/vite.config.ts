@@ -22,6 +22,9 @@ export default defineConfig({
     alias: {
       "@": fileURLToPath(new URL("./client/src", import.meta.url)),
       "@shared": fileURLToPath(new URL("./src/shared", import.meta.url)),
+      // Type-only: the client imports `AppRouter` from the server for tRPC
+      // inference. It never pulls server *values* into the browser bundle.
+      "@server": fileURLToPath(new URL("./src/server", import.meta.url)),
     },
   },
   build: {

@@ -62,6 +62,16 @@ from it (`… as const satisfies readonly JobType[]`,
 instead of drifting silently. The wire DTOs in `src/shared` are the deliberate
 exception (the client bundle can't import `bullmq`).
 
+**The API contract is tRPC.** The client↔server *contract* — which procedure
+takes which input and returns which shape — is the `AppRouter` type, defined by
+`server/trpc/router.ts` and consumed by the browser as a **type-only** import
+(`import type { AppRouter } from "@server/trpc/router"`, so no server code enters
+the bundle). Procedure **inputs** are Zod schemas (`server/trpc/inputs.ts`);
+**outputs** are inferred from the inspector each procedure calls. So the DTOs in
+`src/shared` stay the shared *shapes*, but nothing re-declares the *endpoints* or
+their return types on the client — `lib/api/` is a thin, fully-inferred facade
+over the tRPC client. Add or change a procedure and every call site re-checks.
+
 ---
 
 ## Server — `src/`
@@ -84,14 +94,21 @@ src/
       flows.ts                 FlowNode · JobFlow · FlowSummary
       alerts.ts                Alert*
   server/
-    app.ts                     composition: build the Hono app, mount routes
+    app.ts                     composition: build the Hono app, mount tRPC + SPA
     context.ts                 the board context (DI container; owns connections + inspectors)
     options.ts                 option normalization
+    config.ts                  build the per-request CockpitConfig (shell + config procedure)
     client.ts                  serve the built SPA
-    middleware/                auth.ts (cross-cutting request middleware)
-    http/                      http-error.ts · validate.ts · contracts.ts
+    middleware/                auth.ts (auth resolution · permission model · effective perms)
+    http/                      http-error.ts (transport-agnostic error thrown by inspectors)
+    trpc/                      ← the API layer (replaces the old REST routes)
+      trpc.ts                  init · context · error-normalizer · authed/permission procedures
+      inputs.ts                one Zod schema per procedure input (path params + body)
+      handler.ts               mount the fetch adapter on Hono under /api/trpc
+      router.ts                compose the domain routers → `appRouter` + `type AppRouter`
+      routers/                 one file per domain (config/overview/queues/jobs/…): thin —
+                               parse input → call an inspector → return (no business logic)
     infra/                     redis.ts · util/preview.ts (low-level helpers)
-    routes/                    one file per domain (already split — keep)
     durable/                   protocol.ts · derive.ts (durable Redis protocol, mirrored)
     inspectors/
       bullmq/                  ← split of the old 966-line bullmq-inspector
@@ -137,7 +154,8 @@ client/src/
     charts/     (exists) donut · bar-list · throughput · chart-tooltip · queue-bar-chart
   lib/
     *.ts        pure utils: format · search · base-path · use-now
-    api/        api.ts · query.ts (data layer)
+    api/        client.ts (tRPC client + inferred RouterInputs/Outputs) ·
+                index.ts (the `api` facade) · errors.ts (errorStatus/errorMessage) · query.ts
     providers/  React context/state: config · theme · time · toast · confirm · actions
     tokens.ts   design tokens / status→class maps (see "Where config goes")
     icons.tsx · chart.ts · status.ts   (token-level mappings; may move under tokens/ later)
@@ -244,6 +262,7 @@ with `pnpm typecheck && pnpm build`.
 - [x] 5. Per feature: root collapsed to **`index.ts` only** — pages → `pages/`, UI → `components/`, config → `config/` (`columns.tsx` hooks + `constants.ts`); public surface exported from `index.ts`, external imports routed through it (router + cross-feature). ✓
 - [x] 6. Split the largest views: `durable-waterfall/` (model.ts · tooltips.tsx · index.tsx), `durable-instance-panel/` (index · summary · step-detail · event-log), overview-page (sub-components → `overview/components/`, page 446→238). ✓
 - [x] 7. `lib/providers/` (config · confirm · time · toast · theme · actions) + `lib/api/` (index.ts + query.ts); `server/` root level-grouped into `middleware/` (auth) · `http/` (http-error · validate · contracts) · `infra/` (redis · util/). ✓
+- [x] 8. **tRPC contract.** Replaced the hand-written REST layer (`server/routes/*`, `http/validate.ts`, `http/contracts.ts`, and the client's hand-annotated `api`) with a shared tRPC `AppRouter`: `server/trpc/` (routers call the same inspectors — zero business-logic change), the browser consuming `AppRouter` as a type-only import so `lib/api/` became a thin, fully-inferred facade. Inspectors still throw the transport-agnostic `HttpError`; a base tRPC middleware maps it to the right code (400/403/404). ✓
 
 ```
 

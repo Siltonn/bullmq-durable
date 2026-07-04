@@ -7,7 +7,7 @@
  * server/node dependencies into the browser bundle.
  *
  * This barrel re-exports every domain so `@shared/dto` stays a single import.
- * Zod request/param schemas live separately in `src/server/contracts.ts`.
+ * Zod request/input schemas live separately in `src/server/trpc/inputs.ts`.
  */
 
 export * from "./common"

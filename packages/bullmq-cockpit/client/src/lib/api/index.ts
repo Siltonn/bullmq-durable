@@ -1,246 +1,126 @@
 /**
- * The typed API client.
+ * The typed API facade.
  *
- * One tiny `request` helper does the fetch + error handling; everything else is
- * a thin, fully-typed wrapper returning the shared wire DTOs. Errors become
- * {@link ApiError} so React Query and the UI can branch on status/code.
+ * Every method delegates to the tRPC {@link trpc} client, so its arguments and
+ * return value are **inferred from the server router** — there is not a single
+ * hand-written wire type here anymore. The method names/signatures mirror the
+ * old REST client so call sites stay unchanged; they just gained type safety
+ * that tracks the server automatically.
+ *
+ * Path parameters (`queueName`, `jobId`, `instanceId`, `id`) become fields on
+ * the procedure input, which is why the wrappers spread them into one object.
  */
 
-import type {
-  ActionResult,
-  AlertChannel,
-  AlertMetric,
-  AlertOperator,
-  AlertRule,
-  AlertsOverview,
-  DurableEvent,
-  DurableInstanceDetail,
-  DurableInstanceList,
-  DurableLogEntry,
-  DurableStep,
-  FlowSummary,
-  Health,
-  JobDependencies,
-  JobDetail,
-  JobFlow,
-  JobLogs,
-  JobSummary,
-  OverviewStats,
-  Paginated,
-  QueueActivity,
-  QueueDetail,
-  QueueMetrics,
-  QueueSummary,
-  RedisInfo,
-  SchedulerSummary,
-  CockpitConfig,
-  StuckReport,
-  SystemSignals,
-} from "@shared/dto"
-import { apiBase } from "@/lib/base-path"
+import { trpc, type RouterInputs } from "./client"
 
-export class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-  ) {
-    super(message)
-    this.name = "ApiError"
-  }
-}
+export { errorMessage, errorStatus } from "./errors"
 
-/** Build a query string from an object, dropping empty values. */
-function qs(params: object): string {
-  const search = new URLSearchParams()
-  for (const [key, value] of Object.entries(params)) {
-    if (value === undefined || value === null || value === "") continue
-    search.set(key, String(value))
-  }
-  const str = search.toString()
-  return str ? `?${str}` : ""
-}
-
-const enc = encodeURIComponent
-
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${apiBase()}${path}`, {
-    method,
-    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-    credentials: "include",
-  })
-
-  if (!res.ok) {
-    let code = "error"
-    let message = res.statusText
-    try {
-      const payload = (await res.json()) as { error?: string; message?: string }
-      code = payload.error ?? code
-      message = payload.message ?? message
-    } catch {
-      // non-JSON error body — keep the status text
-    }
-    throw new ApiError(res.status, code, message)
-  }
-
-  if (res.status === 204) return undefined as T
-  return (await res.json()) as T
-}
-
-const get = <T>(path: string): Promise<T> => request<T>("GET", path)
-const post = <T>(path: string, body?: unknown): Promise<T> => request<T>("POST", path, body)
-
-export interface JobsQuery {
-  status?: string
-  jobName?: string
-  search?: string
-  page?: number
-  pageSize?: number
-}
-
-export interface DurableQuery {
-  status?: string
-  queue?: string
-  jobName?: string
-  search?: string
-  stuckOnly?: boolean
-  sort?: string
-  order?: string
-  page?: number
-  pageSize?: number
-}
-
-export interface CleanBody {
-  graceMs?: number
-  limit?: number
+// Input shapes, derived from the router (not re-declared). The `queueName` /
+// `id` path params are supplied by the wrapper, so callers pass only the body.
+//
+// `status` is kept as a plain string: it is a URL/UI-driven filter value, and
+// the server validates it against its enum (a bad value → a `400`). The wrapper
+// narrows it to the router's enum at the single call boundary below.
+export type JobsQuery = Partial<Omit<RouterInputs["jobs"]["list"], "queueName" | "status">> & {
   status?: string
 }
-
-export interface AddJobBody {
-  name: string
-  data?: unknown
-  delay?: number
-  priority?: number
-  attempts?: number
-  jobId?: string
+export type DurableQuery = Partial<Omit<RouterInputs["durable"]["list"], "status">> & {
+  status?: string
 }
-
-export interface AddSchedulerBody {
-  id: string
-  name?: string
-  pattern?: string
-  every?: number
-  tz?: string
-  limit?: number
-  data?: unknown
-}
-
-export interface AlertRuleBody {
-  id?: string
-  name: string
-  metric: AlertMetric
-  queue?: string
-  operator: AlertOperator
-  threshold: number
-  enabled: boolean
-  channels: string[]
-}
-
-export interface AlertChannelBody {
-  id?: string
-  name: string
-  type: "webhook" | "slack"
-  url: string
-}
+export type CleanBody = Partial<Omit<RouterInputs["queues"]["clean"], "queueName">>
+export type AddJobBody = Omit<RouterInputs["jobs"]["add"], "queueName">
+export type AddSchedulerBody = Omit<RouterInputs["schedulers"]["add"], "queueName">
+export type AlertRuleBody = RouterInputs["alerts"]["saveRule"]
+export type AlertChannelBody = RouterInputs["alerts"]["saveChannel"]
 
 export const api = {
-  config: () => get<CockpitConfig>("/config"),
+  config: () => trpc.config.get.query(),
 
   // Overview
-  overview: () => get<OverviewStats>("/overview"),
-  signals: (windowMinutes?: number) =>
-    get<SystemSignals>(`/overview/signals${qs({ windowMinutes })}`),
+  overview: () => trpc.overview.stats.query(),
+  signals: (windowMinutes?: number) => trpc.overview.signals.query({ windowMinutes }),
 
   // Activity (derived golden-signals: throughput + latency + job names)
   queueActivity: (queue: string, windowMinutes?: number) =>
-    get<QueueActivity>(`/queues/${enc(queue)}/activity${qs({ windowMinutes })}`),
+    trpc.queues.activity.query({ queueName: queue, windowMinutes }),
 
   // Queues
-  queues: () => get<QueueSummary[]>("/queues"),
-  queue: (name: string) => get<QueueDetail>(`/queues/${enc(name)}`),
-  pauseQueue: (name: string) => post<ActionResult>(`/queues/${enc(name)}/pause`),
-  resumeQueue: (name: string) => post<ActionResult>(`/queues/${enc(name)}/resume`),
-  drainQueue: (name: string) => post<ActionResult>(`/queues/${enc(name)}/drain`),
+  queues: () => trpc.queues.list.query(),
+  queue: (name: string) => trpc.queues.get.query({ queueName: name }),
+  pauseQueue: (name: string) => trpc.queues.pause.mutate({ queueName: name }),
+  resumeQueue: (name: string) => trpc.queues.resume.mutate({ queueName: name }),
+  drainQueue: (name: string) => trpc.queues.drain.mutate({ queueName: name }),
   cleanQueue: (name: string, body: CleanBody) =>
-    post<ActionResult>(`/queues/${enc(name)}/clean`, body),
+    trpc.queues.clean.mutate({ queueName: name, ...body }),
 
   // Jobs
   jobs: (queue: string, query: JobsQuery) =>
-    get<Paginated<JobSummary>>(`/queues/${enc(queue)}/jobs${qs(query)}`),
-  addJob: (queue: string, body: AddJobBody) =>
-    post<ActionResult>(`/queues/${enc(queue)}/jobs`, body),
-  job: (queue: string, jobId: string) => get<JobDetail>(`/queues/${enc(queue)}/jobs/${enc(jobId)}`),
-  jobLogs: (queue: string, jobId: string) =>
-    get<JobLogs>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/logs`),
+    trpc.jobs.list.query({
+      queueName: queue,
+      ...query,
+      status: query.status as RouterInputs["jobs"]["list"]["status"],
+    }),
+  addJob: (queue: string, body: AddJobBody) => trpc.jobs.add.mutate({ queueName: queue, ...body }),
+  job: (queue: string, jobId: string) => trpc.jobs.get.query({ queueName: queue, jobId }),
+  jobLogs: (queue: string, jobId: string) => trpc.jobs.logs.query({ queueName: queue, jobId }),
   jobDependencies: (queue: string, jobId: string) =>
-    get<JobDependencies>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/dependencies`),
-  jobFlow: (queue: string, jobId: string) =>
-    get<JobFlow>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/flow`),
-  retryJob: (queue: string, jobId: string) =>
-    post<ActionResult>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/retry`),
+    trpc.jobs.dependencies.query({ queueName: queue, jobId }),
+  jobFlow: (queue: string, jobId: string) => trpc.jobs.flow.query({ queueName: queue, jobId }),
+  retryJob: (queue: string, jobId: string) => trpc.jobs.retry.mutate({ queueName: queue, jobId }),
   promoteJob: (queue: string, jobId: string) =>
-    post<ActionResult>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/promote`),
-  removeJob: (queue: string, jobId: string) =>
-    post<ActionResult>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/remove`),
+    trpc.jobs.promote.mutate({ queueName: queue, jobId }),
+  removeJob: (queue: string, jobId: string) => trpc.jobs.remove.mutate({ queueName: queue, jobId }),
   duplicateJob: (queue: string, jobId: string) =>
-    post<ActionResult>(`/queues/${enc(queue)}/jobs/${enc(jobId)}/duplicate`),
+    trpc.jobs.duplicate.mutate({ queueName: queue, jobId }),
   bulkRetry: (queue: string, ids: string[]) =>
-    post<ActionResult>(`/queues/${enc(queue)}/bulk/retry`, { ids }),
+    trpc.jobs.bulkRetry.mutate({ queueName: queue, ids }),
   bulkRemove: (queue: string, ids: string[]) =>
-    post<ActionResult>(`/queues/${enc(queue)}/bulk/remove`, { ids }),
+    trpc.jobs.bulkRemove.mutate({ queueName: queue, ids }),
 
   // Schedulers
-  schedulers: () => get<SchedulerSummary[]>("/schedulers"),
-  queueSchedulers: (queue: string) => get<SchedulerSummary[]>(`/schedulers/${enc(queue)}`),
+  schedulers: () => trpc.schedulers.list.query(),
+  queueSchedulers: (queue: string) => trpc.schedulers.listForQueue.query({ queueName: queue }),
   addScheduler: (queue: string, body: AddSchedulerBody) =>
-    post<ActionResult>(`/schedulers/${enc(queue)}`, body),
+    trpc.schedulers.add.mutate({ queueName: queue, ...body }),
   removeScheduler: (queue: string, id: string) =>
-    post<ActionResult>(`/schedulers/${enc(queue)}/${enc(id)}/remove`),
+    trpc.schedulers.remove.mutate({ queueName: queue, id }),
 
   // Flows
-  flows: () => get<FlowSummary[]>("/flows"),
+  flows: () => trpc.flows.list.query(),
 
   // Alerts
-  alerts: () => get<AlertsOverview>("/alerts"),
-  alertRules: () => get<AlertRule[]>("/alerts/rules"),
-  saveAlertRule: (body: AlertRuleBody) => post<ActionResult>("/alerts/rules", body),
-  removeAlertRule: (id: string) => post<ActionResult>(`/alerts/rules/${enc(id)}/remove`),
-  toggleAlertRule: (id: string) => post<ActionResult>(`/alerts/rules/${enc(id)}/toggle`),
-  alertChannels: () => get<AlertChannel[]>("/alerts/channels"),
-  saveAlertChannel: (body: AlertChannelBody) => post<ActionResult>("/alerts/channels", body),
-  removeAlertChannel: (id: string) => post<ActionResult>(`/alerts/channels/${enc(id)}/remove`),
-  testAlertChannel: (id: string) => post<ActionResult>(`/alerts/channels/${enc(id)}/test`),
+  alerts: () => trpc.alerts.overview.query(),
+  alertRules: () => trpc.alerts.listRules.query(),
+  saveAlertRule: (body: AlertRuleBody) => trpc.alerts.saveRule.mutate(body),
+  removeAlertRule: (id: string) => trpc.alerts.removeRule.mutate({ id }),
+  toggleAlertRule: (id: string) => trpc.alerts.toggleRule.mutate({ id }),
+  alertChannels: () => trpc.alerts.listChannels.query(),
+  saveAlertChannel: (body: AlertChannelBody) => trpc.alerts.saveChannel.mutate(body),
+  removeAlertChannel: (id: string) => trpc.alerts.removeChannel.mutate({ id }),
+  testAlertChannel: (id: string) => trpc.alerts.testChannel.mutate({ id }),
 
   // Metrics + Redis
-  metrics: (queue: string) => get<QueueMetrics>(`/queues/${enc(queue)}/metrics`),
-  redisInfo: () => get<RedisInfo>("/health/redis"),
+  metrics: (queue: string) => trpc.queues.metrics.query({ queueName: queue }),
+  redisInfo: () => trpc.health.redis.query(),
 
   // Durable
   durableInstances: (query: DurableQuery) =>
-    get<DurableInstanceList>(`/durable/instances${qs(query)}`),
-  durableInstance: (id: string) => get<DurableInstanceDetail>(`/durable/instances/${enc(id)}`),
-  durableSteps: (id: string) => get<DurableStep[]>(`/durable/instances/${enc(id)}/steps`),
-  durableEvents: (id: string) => get<DurableEvent[]>(`/durable/instances/${enc(id)}/events`),
-  durableLogs: (id: string) => get<DurableLogEntry[]>(`/durable/instances/${enc(id)}/logs`),
-  durableResume: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/resume`),
-  durableRetry: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/retry`),
+    trpc.durable.list.query({
+      ...query,
+      status: query.status as RouterInputs["durable"]["list"]["status"],
+    }),
+  durableInstance: (id: string) => trpc.durable.get.query({ instanceId: id }),
+  durableSteps: (id: string) => trpc.durable.steps.query({ instanceId: id }),
+  durableEvents: (id: string) => trpc.durable.events.query({ instanceId: id }),
+  durableLogs: (id: string) => trpc.durable.logs.query({ instanceId: id }),
+  durableResume: (id: string) => trpc.durable.resume.mutate({ instanceId: id }),
+  durableRetry: (id: string) => trpc.durable.retry.mutate({ instanceId: id }),
   durableRetryCompensation: (id: string) =>
-    post<ActionResult>(`/durable/instances/${enc(id)}/retry-compensation`),
-  durableCancel: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/cancel`),
-  durableDelete: (id: string) => post<ActionResult>(`/durable/instances/${enc(id)}/delete`),
+    trpc.durable.retryCompensation.mutate({ instanceId: id }),
+  durableCancel: (id: string) => trpc.durable.cancel.mutate({ instanceId: id }),
+  durableDelete: (id: string) => trpc.durable.delete.mutate({ instanceId: id }),
 
   // Health
-  health: () => get<Health>("/health"),
-  stuck: (thresholdMs?: number) => get<StuckReport>(`/health/stuck${qs({ thresholdMs })}`),
+  health: () => trpc.health.health.query(),
+  stuck: (thresholdMs?: number) => trpc.health.stuck.query({ thresholdMs }),
 }

@@ -212,30 +212,31 @@ compensation** action that re-runs only the failed compensation steps.
 The **Health** page surfaces stuck instances in four classes: `running_stale`,
 `resume_missed`, `orphan_resume_job`, and `orphan_instance`.
 
-## HTTP API
+## API (tRPC)
 
-All routes are mounted under `{basePath}/api`:
+The API is **[tRPC](https://trpc.io)**, mounted under `{basePath}/api/trpc`. The
+client and server share one contract — the `AppRouter` type — so every call is
+fully type-checked end-to-end with **no hand-written wire types**: procedure
+inputs are validated by Zod and their outputs are inferred from the server.
 
 ```
-GET  /api/overview                       GET /api/overview/signals
-GET  /api/queues                         GET /api/queues/:q
-GET  /api/queues/:q/metrics              GET /api/queues/:q/activity
-POST /api/queues/:q/{pause,resume,clean,drain}
-GET  /api/queues/:q/jobs                 GET /api/queues/:q/jobs/:id
-GET  /api/queues/:q/jobs/:id/{logs,dependencies,flow}
-POST /api/queues/:q/jobs/:id/{retry,promote,remove,duplicate}
-POST /api/queues/:q/bulk/{retry,remove}
-GET  /api/flows
-GET  /api/schedulers                     GET /api/schedulers/:q
-POST /api/schedulers/:q                  POST /api/schedulers/:q/:id/remove
-GET  /api/alerts                         (live evaluation of every rule)
-POST /api/alerts/rules                   POST /api/alerts/rules/:id/{remove,toggle}
-GET  /api/alerts/channels                POST /api/alerts/channels
-POST /api/alerts/channels/:id/{remove,test}
-GET  /api/durable/instances              GET /api/durable/instances/:id
-GET  /api/durable/instances/:id/{steps,events,logs}
-POST /api/durable/instances/:id/{resume,retry,retry-compensation,cancel,delete}
-GET  /api/health                         GET /api/health/{redis,stuck}
+config.get
+overview.{stats,signals}
+queues.{list,get,metrics,activity,pause,resume,clean,drain}
+jobs.{list,add,get,logs,dependencies,flow,retry,promote,remove,duplicate,bulkRetry,bulkRemove}
+schedulers.{list,listForQueue,add,remove}
+flows.list
+alerts.{overview,listRules,saveRule,removeRule,toggleRule,listChannels,saveChannel,removeChannel,testChannel}
+durable.{list,get,steps,events,logs,resume,retry,retryCompensation,cancel,delete}
+health.{health,redis,stuck}
+```
+
+Errors carry an HTTP status (`data.httpStatus`): `400` for invalid input, `403`
+for a missing permission or read-only mode, `404` for a missing resource. The
+`AppRouter` type is exported from the package root for typing your own clients:
+
+```ts
+import type { AppRouter } from "bullmq-cockpit"
 ```
 
 ## Local development

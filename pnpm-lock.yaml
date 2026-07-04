@@ -26,6 +26,9 @@ importers:
       '@nestjs/core':
         specifier: '>=10'
         version: 10.4.22(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@trpc/server':
+        specifier: ^11.18.0
+        version: 11.18.0(typescript@5.6.2)
       bullmq:
         specifier: ^5.0.0
         version: 5.79.1
@@ -66,6 +69,9 @@ importers:
       '@tanstack/react-table':
         specifier: ^8.20.6
         version: 8.21.3(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+      '@trpc/client':
+        specifier: ^11.18.0
+        version: 11.18.0(@trpc/server@11.18.0(typescript@5.6.2))(typescript@5.6.2)
       '@types/express':
         specifier: ^5.0.0
         version: 5.0.6
@@ -2608,6 +2614,19 @@ packages:
 
   '@tokenizer/token@0.3.0':
     resolution: {integrity: sha512-OvjF+z51L3ov0OyAU0duzsYuvO01PH7x4t6DJx+guahgTnBHkhJdG7soQeTSFLWN3efnHyibZ4Z8l2EuWwJN3A==}
+
+  '@trpc/client@11.18.0':
+    resolution: {integrity: sha512-wOqeg3Fvl25V1ZisQhUD3K8G60ZJDlSGJNSyeXrLH24xAo5w6GSR2Kzb1cSNY9Y+IQ2YZvYGZstBU+V/ulo/ow==}
+    hasBin: true
+    peerDependencies:
+      '@trpc/server': 11.18.0
+      typescript: '>=5.7.2'
+
+  '@trpc/server@11.18.0':
+    resolution: {integrity: sha512-JAvXOuNTxgXjIDfQaOvDq1j66LMNfDJUH1IU7Slfn8EvRv2EkH6ehu3A7zpYhjO0syHHiYg77v2lG2JFJgvw7Q==}
+    hasBin: true
+    peerDependencies:
+      typescript: '>=5.7.2'
 
   '@types/babel__core@7.20.5':
     resolution: {integrity: sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==}
@@ -7691,6 +7710,15 @@ snapshots:
       - supports-color
 
   '@tokenizer/token@0.3.0': {}
+
+  '@trpc/client@11.18.0(@trpc/server@11.18.0(typescript@5.6.2))(typescript@5.6.2)':
+    dependencies:
+      '@trpc/server': 11.18.0(typescript@5.6.2)
+      typescript: 5.6.2
+
+  '@trpc/server@11.18.0(typescript@5.6.2)':
+    dependencies:
+      typescript: 5.6.2
 
   '@types/babel__core@7.20.5':
     dependencies:

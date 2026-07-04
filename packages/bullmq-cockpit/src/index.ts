@@ -21,6 +21,13 @@ import type { BullMQCockpitOptions } from "./server/options"
 export { createCockpitApp, type CockpitApp } from "./server/app"
 export { createBoardContext, type BoardContext } from "./server/context"
 export { COCKPIT_VERSION } from "./server/options"
+
+/**
+ * The tRPC contract. The browser client imports this **type** only
+ * (`import type { AppRouter }`) to get end-to-end type safety with zero
+ * hand-written wire types.
+ */
+export type { AppRouter } from "./server/trpc/router"
 export type {
   AuthContext,
   AuthHandler,

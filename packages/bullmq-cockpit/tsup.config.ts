@@ -33,6 +33,7 @@ export default defineConfig({
     "ioredis",
     "hono",
     "zod",
+    "@trpc/server",
     "@hono/node-server",
     "express",
     "fastify",
