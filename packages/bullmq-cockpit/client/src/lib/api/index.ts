@@ -60,21 +60,16 @@ export const api = {
       ...query,
       status: query.status as RouterInputs["jobs"]["list"]["status"],
     }),
-  addJob: (queue: string, body: AddJobBody) =>
-    trpc.jobs.add.mutate({ queueName: queue, ...body }),
+  addJob: (queue: string, body: AddJobBody) => trpc.jobs.add.mutate({ queueName: queue, ...body }),
   job: (queue: string, jobId: string) => trpc.jobs.get.query({ queueName: queue, jobId }),
-  jobLogs: (queue: string, jobId: string) =>
-    trpc.jobs.logs.query({ queueName: queue, jobId }),
+  jobLogs: (queue: string, jobId: string) => trpc.jobs.logs.query({ queueName: queue, jobId }),
   jobDependencies: (queue: string, jobId: string) =>
     trpc.jobs.dependencies.query({ queueName: queue, jobId }),
-  jobFlow: (queue: string, jobId: string) =>
-    trpc.jobs.flow.query({ queueName: queue, jobId }),
-  retryJob: (queue: string, jobId: string) =>
-    trpc.jobs.retry.mutate({ queueName: queue, jobId }),
+  jobFlow: (queue: string, jobId: string) => trpc.jobs.flow.query({ queueName: queue, jobId }),
+  retryJob: (queue: string, jobId: string) => trpc.jobs.retry.mutate({ queueName: queue, jobId }),
   promoteJob: (queue: string, jobId: string) =>
     trpc.jobs.promote.mutate({ queueName: queue, jobId }),
-  removeJob: (queue: string, jobId: string) =>
-    trpc.jobs.remove.mutate({ queueName: queue, jobId }),
+  removeJob: (queue: string, jobId: string) => trpc.jobs.remove.mutate({ queueName: queue, jobId }),
   duplicateJob: (queue: string, jobId: string) =>
     trpc.jobs.duplicate.mutate({ queueName: queue, jobId }),
   bulkRetry: (queue: string, ids: string[]) =>

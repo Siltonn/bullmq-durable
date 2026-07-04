@@ -7,9 +7,7 @@ import { protectedProcedure, router } from "../trpc"
 const ok: ActionResult = { ok: true }
 
 export const schedulersRouter = router({
-  list: protectedProcedure("queue:read").query(({ ctx }) =>
-    ctx.board.bullmq.listAllSchedulers(),
-  ),
+  list: protectedProcedure("queue:read").query(({ ctx }) => ctx.board.bullmq.listAllSchedulers()),
 
   listForQueue: protectedProcedure("queue:read")
     .input(queueParam)

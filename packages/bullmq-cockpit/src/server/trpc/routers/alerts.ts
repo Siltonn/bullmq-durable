@@ -61,9 +61,7 @@ export const alertsRouter = router({
       const delivered = await ctx.board.alerts.testChannel(input.id)
       return {
         ok: delivered,
-        message: delivered
-          ? "Test notification delivered"
-          : "Channel did not accept the request",
+        message: delivered ? "Test notification delivered" : "Channel did not accept the request",
       }
     }),
 })
