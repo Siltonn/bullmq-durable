@@ -96,7 +96,7 @@ export function DurableInstancePanel({
     if (
       await confirm({
         title: "Resume now?",
-        body: "Enqueue a zero-delay resume tick for this instance.",
+        body: "Re-deliver this run now: promotes the job if delayed, revives it if missing.",
         confirmLabel: "Resume",
         confirmColor: "primary",
       })

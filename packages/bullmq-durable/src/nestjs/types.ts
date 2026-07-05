@@ -1,9 +1,12 @@
 /**
- * Option shapes for the NestJS integration.
+ * Option shapes for the NestJS integration. Mirrors `@nestjs/bullmq`'s
+ * developer experience: `forRoot`/`forRootAsync` carry the connection and
+ * global defaults, `registerQueue`/`registerQueueAsync` add per-queue
+ * overrides, and BullMQ-native options pass through under their own names.
  */
 
 import type { ModuleMetadata, Type } from "@nestjs/common"
-import type { ConnectionOptions, JobsOptions } from "bullmq"
+import type { ConnectionOptions, JobsOptions, WorkerOptions } from "bullmq"
 import type { StateStore } from "../store/state-store"
 import type {
   DurableProcessorInput,
@@ -21,6 +24,9 @@ export type DurableInjectionToken =
   | Type<unknown>
   | (new (...args: any[]) => unknown)
 
+/** BullMQ worker options minus what the module wires itself. */
+export type DurableNestWorkerOptions = Partial<Omit<WorkerOptions, "connection" | "prefix">>
+
 /** Root options passed to `DurableBullModule.forRoot`. */
 export interface DurableBullRootOptions {
   connection: ConnectionOptions
@@ -33,13 +39,29 @@ export interface DurableBullRootOptions {
    */
   stateStore?: StateStore
   durablePrefix?: string
-  bullPrefix?: string
+  /** BullMQ's own key prefix, applied to every queue and worker. */
+  prefix?: string
+  /** Default BullMQ job options for every queue (mirrors `BullModule`). */
+  defaultJobOptions?: JobsOptions
+  /**
+   * BullMQ `WorkerOptions` applied to every worker (concurrency, lockDuration,
+   * stalledInterval, limiter, …). Per-queue `workerOptions` shallow-merge over
+   * these.
+   */
+  workerOptions?: DurableNestWorkerOptions
   // Defaults applied to every worker unless overridden per queue.
-  concurrency?: number
-  lockTimeout?: DurationInput
-  retention?: RetentionOptions
   defaultStepOptions?: StepOptions
   defaultRollbackRetry?: RetryOptions
+
+  /** @deprecated Renamed to `prefix`. Removed in 0.3.0. */
+  bullPrefix?: string
+  /** @deprecated Move into `workerOptions.concurrency`. Removed in 0.3.0. */
+  concurrency?: number
+  /** @deprecated The instance lock is internal since 0.2.0; ignored. Removed in 0.3.0. */
+  lockTimeout?: DurationInput
+  /** @deprecated State follows the job since 0.2.0; ignored. Removed in 0.3.0. */
+  retention?: RetentionOptions
+  /** @deprecated Logs live in the job log; bound with `defaultJobOptions.keepLogs`. Removed in 0.3.0. */
   maxLogs?: number
 }
 
@@ -61,14 +83,14 @@ export interface DurableBullRootAsyncOptions extends Pick<ModuleMetadata, "impor
 export interface DurableQueueRegistration {
   name: string
   durablePrefix?: string
-  bullPrefix?: string
-  concurrency?: number
-  lockTimeout?: DurationInput
-  retention?: RetentionOptions
+  /** BullMQ's own key prefix for this queue (overrides the root default). */
+  prefix?: string
+  /** Default BullMQ job options for this queue (overrides the root default). */
+  defaultJobOptions?: JobsOptions
+  /** BullMQ `WorkerOptions` for this queue's worker (over the root default). */
+  workerOptions?: DurableNestWorkerOptions
   defaultStepOptions?: StepOptions
   defaultRollbackRetry?: RetryOptions
-  maxLogs?: number
-  defaultJobOptions?: JobsOptions
   /**
    * Processor class(es) for this queue. Listing them here auto-registers them as
    * providers (and exports them) so the explorer discovers them — you no longer
@@ -76,6 +98,17 @@ export interface DurableQueueRegistration {
    * `providers`.
    */
   processor?: Type<unknown> | Type<unknown>[]
+
+  /** @deprecated Renamed to `prefix`. Removed in 0.3.0. */
+  bullPrefix?: string
+  /** @deprecated Move into `workerOptions.concurrency`. Removed in 0.3.0. */
+  concurrency?: number
+  /** @deprecated The instance lock is internal since 0.2.0; ignored. Removed in 0.3.0. */
+  lockTimeout?: DurationInput
+  /** @deprecated State follows the job since 0.2.0; ignored. Removed in 0.3.0. */
+  retention?: RetentionOptions
+  /** @deprecated Logs live in the job log; bound with `defaultJobOptions.keepLogs`. Removed in 0.3.0. */
+  maxLogs?: number
 }
 
 /** Async form of {@link DurableQueueRegistration}: resolve per-queue options from DI. */

@@ -1,6 +1,6 @@
 {
   "name": "bullmq-cockpit",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Modern dashboard and durable instance inspector for BullMQ.",
   "type": "module",
   "license": "MIT",
@@ -109,7 +109,8 @@
     "bullmq": "^5.0.0",
     "hono": "^4.6.14",
     "ioredis": "^5.4.1",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "bullmq-durable": "workspace:*"
   },
   "peerDependencies": {
     "@nestjs/common": ">=10",

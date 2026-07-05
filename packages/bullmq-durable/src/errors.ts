@@ -1,11 +1,17 @@
 /**
  * Error types used for durable control flow.
  *
- * Some of these are genuine failures (`DurableNonRetryableError`,
- * `DurableTimeoutError`) while others are *control-flow signals* that the
- * runtime interprets rather than treats as failures (`DurableYieldError`,
- * `RetryLaterError`, `DurableCancelledError`).
+ * Two layers:
+ *  - *Inner* signals interpreted by the runtime, never seen by BullMQ
+ *    (`DurableYieldError`, `RetryLaterError`, `DurableCancelledError`,
+ *    `DurableNonRetryableError`, `DurableRetriesExhaustedError`).
+ *  - *Boundary* errors thrown from the BullMQ processor wrapper so the job
+ *    lands in the right BullMQ state (`DurableTerminalJobError`,
+ *    `DurableCancelledJobError` — both `UnrecoverableError`, so BullMQ never
+ *    burns `attempts` re-delivering a run whose outcome is already settled).
  */
+
+import { UnrecoverableError } from "bullmq"
 
 /** Base class for every error raised by bullmq-durable. */
 export class DurableError extends Error {
@@ -83,6 +89,68 @@ export class DurableTimeoutError extends DurableError {
   constructor(message: string) {
     super(message)
   }
+}
+
+/**
+ * Boundary error: the durable run reached a terminal failure (compensation and
+ * `onFailure` have already run — or the instance was already terminally failed
+ * and a stray delivery replayed the stored error). Extends BullMQ's
+ * `UnrecoverableError` so the job fails WITHOUT consuming further attempts:
+ * every step failure is checkpointed and would replay identically, so a BullMQ
+ * retry could never change the outcome.
+ */
+export class DurableTerminalJobError extends UnrecoverableError {
+  constructor(
+    message: string,
+    override readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = new.target.name
+  }
+}
+
+/**
+ * Boundary error: the run was cancelled while its job was active. Thrown from
+ * the processor wrapper so the job lands in `failed` (reason "cancelled")
+ * instead of fake-completing. Extends `UnrecoverableError` — a cancelled run
+ * must not be retried by BullMQ.
+ */
+export class DurableCancelledJobError extends UnrecoverableError {
+  constructor(readonly instanceId: string) {
+    super(`Durable instance "${instanceId}" was cancelled`)
+    this.name = new.target.name
+  }
+}
+
+/**
+ * Marker for errors that ARE a step's settled failure (retry budget spent, or
+ * a cached failure replayed). The runtime classifies on this identity instead
+ * of guessing from context state: if user code catches a step failure,
+ * recovers, and a DIFFERENT error later escapes the tick, that error carries
+ * no marker and correctly rides the job-level retry budget. Registered via
+ * `Symbol.for` so the check survives duplicated module instances.
+ */
+const STEP_FAILURE_MARKER = Symbol.for("bullmq-durable:step-failure")
+
+/** Tag an error as a settled step failure (no-op for primitives). */
+export function markStepFailure<T>(error: T): T {
+  if (error !== null && (typeof error === "object" || typeof error === "function")) {
+    try {
+      Object.defineProperty(error, STEP_FAILURE_MARKER, { value: true, configurable: true })
+    } catch {
+      // frozen error object — classification degrades to job-level retries
+    }
+  }
+  return error
+}
+
+/** Whether an error is a settled step failure (see {@link markStepFailure}). */
+export function isStepFailure(error: unknown): boolean {
+  return (
+    error !== null &&
+    (typeof error === "object" || typeof error === "function") &&
+    (error as Record<symbol, unknown>)[STEP_FAILURE_MARKER] === true
+  )
 }
 
 /** Type guard for the internal yield signal. */

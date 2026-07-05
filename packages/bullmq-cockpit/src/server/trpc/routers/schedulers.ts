@@ -11,12 +11,16 @@ export const schedulersRouter = router({
 
   listForQueue: protectedProcedure("queue:read")
     .input(queueParam)
-    .query(({ ctx, input }) => ctx.board.bullmq.listSchedulers(input.queueName)),
+    .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
+      return ctx.board.bullmq.listSchedulers(input.queueName)
+    }),
 
   add: protectedProcedure("queue:write")
     .input(addSchedulerInput)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
       const { queueName, ...body } = input
+      await ctx.board.requireQueue(queueName)
       await ctx.board.bullmq.addScheduler(queueName, body)
       return ok
     }),
@@ -24,6 +28,7 @@ export const schedulersRouter = router({
   remove: protectedProcedure("queue:write")
     .input(removeSchedulerInput)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.removeScheduler(input.queueName, input.id)
       return ok
     }),

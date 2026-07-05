@@ -10,11 +10,13 @@
 import {
   Inject,
   Injectable,
+  type OnApplicationShutdown,
   type OnModuleDestroy,
   type OnModuleInit,
   Optional,
 } from "@nestjs/common"
 import { DiscoveryService, ModuleRef, Reflector } from "@nestjs/core"
+import { DurableQueue } from "../queue"
 import type { StateStore } from "../store/state-store"
 import { DurableWorker } from "../worker"
 import type { DurableFailureHandler, DurableProcessor, DurableWorkerOptions } from "../types"
@@ -41,8 +43,9 @@ const defaultWorkerFactory: DurableWorkerFactory = (queueName, processor, option
   new DurableWorker(queueName, processor, options)
 
 @Injectable()
-export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
+export class DurableExplorer implements OnModuleInit, OnModuleDestroy, OnApplicationShutdown {
   private readonly workers: DurableWorkerHandle[] = []
+  private closed = false
 
   constructor(
     @Inject(DiscoveryService) private readonly discovery: DiscoveryService,
@@ -97,8 +100,32 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    await this.shutdown()
+  }
+
+  /** Forced-shutdown path (e.g. `app.enableShutdownHooks()` signals). */
+  async onApplicationShutdown(): Promise<void> {
+    await this.shutdown()
+  }
+
+  /** Idempotent teardown shared by both shutdown hooks. */
+  private async shutdown(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+
     await Promise.all(this.workers.map((worker) => worker.close().catch(() => undefined)))
     this.workers.length = 0
+
+    // Close every instantiated injectable DurableQueue — including queues with
+    // their own store (a `registerQueue` that overrides `durablePrefix`) and
+    // producer-only queues no worker corresponds to. Un-injected providers were
+    // never instantiated and opened no connection.
+    for (const wrapper of this.discovery.getProviders()) {
+      const instance = wrapper.instance
+      if (instance instanceof DurableQueue) {
+        await instance.close().catch(() => undefined)
+      }
+    }
 
     // Close the shared store only when we created it; a user-supplied store is
     // theirs to manage. (Workers receive the shared store but never own it.)
@@ -184,18 +211,28 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy {
     }
     const queue = this.get<DurableQueueRegistration>(getDurableQueueOptionsToken(queueName))
 
-    return {
+    // BullMQ worker options: root-level defaults, shallow-merged under the
+    // per-queue overrides. The deprecated top-level `concurrency` still applies
+    // when `workerOptions` doesn't set one.
+    const workerOptions = { ...root.workerOptions, ...queue?.workerOptions }
+    const concurrency = workerOptions.concurrency ?? queue?.concurrency ?? root.concurrency
+
+    const options: DurableWorkerOptions = {
+      ...workerOptions,
       connection: root.connection,
+      prefix: queue?.prefix ?? queue?.bullPrefix ?? root.prefix ?? root.bullPrefix,
       durablePrefix: queue?.durablePrefix ?? root.durablePrefix,
-      bullPrefix: queue?.bullPrefix ?? root.bullPrefix,
-      concurrency: queue?.concurrency ?? root.concurrency,
-      lockTimeout: queue?.lockTimeout ?? root.lockTimeout,
-      retention: queue?.retention ?? root.retention,
       defaultStepOptions: queue?.defaultStepOptions ?? root.defaultStepOptions,
       defaultRollbackRetry: queue?.defaultRollbackRetry ?? root.defaultRollbackRetry,
-      maxLogs: queue?.maxLogs ?? root.maxLogs,
       stateStore: reuseSharedStore(this.sharedStore, root, queue?.durablePrefix),
+      // Deprecated 0.1.x fields pass through so the worker's option
+      // normalisation warns about them in one central place.
+      lockTimeout: queue?.lockTimeout ?? root.lockTimeout,
+      retention: queue?.retention ?? root.retention,
+      maxLogs: queue?.maxLogs ?? root.maxLogs,
     }
+    if (concurrency !== undefined) options.concurrency = concurrency
+    return options
   }
 
   /** Resolve an optional provider by token without throwing when absent. */

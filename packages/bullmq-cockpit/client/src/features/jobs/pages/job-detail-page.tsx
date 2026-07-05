@@ -193,7 +193,7 @@ export function JobDetailPage({ queueName, jobId }: { queueName: string; jobId: 
                     color={job.durable.isResume ? "secondary" : "primary"}
                     startContent={<CockpitIcon name="durable" width={12} />}
                   >
-                    {job.durable.isResume ? "durable · resume tick" : "durable"}
+                    {job.durable.isResume ? "durable · legacy resume job" : "durable"}
                   </Chip>
                 )}
               </div>
@@ -305,7 +305,7 @@ export function JobDetailPage({ queueName, jobId }: { queueName: string; jobId: 
             <CockpitIcon name="durable" width={16} className="text-primary" /> Durable execution
             {job.durable.isResume && (
               <span className="text-xs font-normal text-foreground-400">
-                (this job is a resume tick)
+                (this is a legacy 0.1.x resume job)
               </span>
             )}
           </h2>

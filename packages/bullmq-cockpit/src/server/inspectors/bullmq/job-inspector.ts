@@ -9,7 +9,7 @@ import type {
   JobSummary,
   Paginated,
 } from "../../../shared/dto"
-import { createInstanceId, DURABLE_META_KEY, isResumeEnvelope } from "../../durable/protocol"
+import { createInstanceId, DURABLE_META_KEY, isResumeEnvelope } from "bullmq-durable"
 import { notFound } from "../../http/http-error"
 import { durationBetween } from "../../infra/util/preview"
 import { ALL_JOB_TYPES, type BullMQInspectorDeps, jobCounts, parseJobKey } from "./shared"
@@ -26,7 +26,9 @@ export interface JobListQuery {
 export function createJobInspector(deps: BullMQInspectorDeps) {
   const { getQueue, bullPrefix, durable } = deps
 
-  /** A resume job links to its instance immediately (no store lookup needed). */
+  /** LEGACY (0.1.x rolling-upgrade window): an envelope resume job links to its
+   *  instance immediately. 0.2.x jobs never carry envelopes — `linkDurableOriginals`
+   *  covers them. Removed in 0.3.0. */
   const resumeLink = (job: Job): JobSummary["durable"] => {
     if (isResumeEnvelope(job.data)) {
       const meta = job.data[DURABLE_META_KEY]

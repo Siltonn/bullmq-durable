@@ -63,7 +63,12 @@ export class GenerationService {
     DurableBullModule.forRoot({ connection }),
     DurableBullModule.registerQueue({
       name: "generation",
-      retention: { completed: "7d", failed: "30d" },
+      // One run = one job: BullMQ's own cleanup options govern the run record.
+      defaultJobOptions: {
+        removeOnComplete: { age: 7 * 24 * 3600 },
+        removeOnFail: { age: 30 * 24 * 3600 },
+        keepLogs: 1000,
+      },
       // Listing the processor here auto-registers it — no separate `providers` entry.
       processor: GenerationProcessor,
     }),

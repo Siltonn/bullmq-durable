@@ -66,6 +66,6 @@ export function stepStatusMeta(status: DurableStepStatus): StatusMeta {
 export const STUCK_LABELS: Record<StuckKind, string> = {
   running_stale: "Running (stale)",
   resume_missed: "Resume missed",
-  orphan_resume_job: "Orphan resume job",
+  orphan_resume_job: "Orphan resume job (legacy 0.1.x)",
   orphan_instance: "Orphan instance",
 }

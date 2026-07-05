@@ -15,15 +15,21 @@
  *    - media-flow  processed by a worker that OOM-kills one rendition → a mix of
  *                  completed / failed / waiting-children
  *
- *  Durable queues
- *    - generation  completed, sleeping, retrying, failed, cancelled, plus a
- *                  direct-written "running_stale" + an "orphan_resume_job"
+ *  Durable queues (0.2.x: one run = one job; the job is the run's carrier)
+ *    - generation  completed×N, sleeping, retrying(poll), failed, cancelled,
+ *                  step-retry history (flaky step), job-level backoff (transient
+ *                  non-step error waiting out BullMQ attempts), saga compensation:
+ *                  failed-with-rollbacks, compensation_failed, parked compensating;
+ *                  plus a direct-written "running_stale", a legacy (0.1.x) orphan
+ *                  resume job and a legacy shim-carried run
  *    - exports     a second durable queue (completed + sleeping) for filter variety
- *    - media       a 6-step pipeline: completed×2, sleeping, failed (deep in
- *                  `transcode`), a high-attempt "retrying", and a "resume_missed"
+ *    - media       a 6-step pipeline: completed×2 (+ synthesized waterfall run),
+ *                  sleeping, failed (deep in `transcode`), a high-attempt
+ *                  "retrying" (live delayed carrier), a "resume_missed" (carrier
+ *                  present but overdue) and an "orphan_instance" (carrier gone)
  *
- * Between them the four stuck kinds (running_stale, resume_missed,
- * orphan_resume_job, orphan_instance) all light up on the Health page.
+ * Between them the stuck kinds (running_stale, resume_missed, orphan_instance,
+ * legacy orphan_resume_job) all light up on the Health page.
  *
  * Usage:
  *   docker compose -f packages/bullmq-cockpit/docker-compose.yml up -d
@@ -45,6 +51,26 @@ const connection = {
   db: url.pathname ? Number(url.pathname.slice(1)) || 0 : 0,
 }
 const DURABLE_PREFIX = "bullmq-durable"
+
+/**
+ * Direct-written fixtures must also register in the per-queue status index —
+ * the dashboard lists from the index, never a scan. Mirrors what the runtime's
+ * store scripts do on init/terminal transitions.
+ */
+async function indexInstance(
+  redis: Redis,
+  queueName: string,
+  instanceId: string,
+  status: "active" | "completed" | "failed" | "cancelled" | "compensation_failed",
+  terminalAt = Date.now(),
+): Promise<void> {
+  await redis.sadd(`${DURABLE_PREFIX}:queues`, queueName)
+  if (status === "active") {
+    await redis.sadd(`${DURABLE_PREFIX}:idx:${queueName}:active`, instanceId)
+  } else {
+    await redis.zadd(`${DURABLE_PREFIX}:idx:${queueName}:done:${status}`, terminalAt, instanceId)
+  }
+}
 const RESET = process.argv.includes("--reset") || process.env.RESET === "1"
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -102,16 +128,40 @@ async function seedPendingQueue(
 
 interface VideoJob {
   id: string
-  mode: "complete" | "sleep" | "retry" | "fail"
+  mode:
+    | "complete"
+    | "sleep"
+    | "retry"
+    | "fail"
+    | "flaky-step" // one genuine step failure, then success -> step_retry history
+    | "job-backoff" // transient NON-step error -> BullMQ attempts/backoff own it
+    | "comp-ok" // terminal failure, every compensation succeeds -> failed + report
+    | "comp-fail" // a compensation always fails fast -> compensation_failed
+    | "comp-parked" // a compensation retry parks 10m -> status "compensating"
   userId: string
   prompt: string
 }
 
 async function seedGeneration(redis: Redis): Promise<void> {
-  const queue = new DurableQueue<VideoJob>("generation", { connection })
+  const queue = new DurableQueue<VideoJob>("generation", {
+    connection,
+    // 0.2.x: the job IS the run record — keep it around for the dashboard and
+    // bound its log list (where ctx.log writes).
+    defaultJobOptions: { keepLogs: 200 },
+  })
+  // Per-run scratch flags so "fail once, then succeed" survives re-deliveries.
+  const failedOnce = new Set<string>()
   const worker = new DurableWorker(
     "generation",
     async (job: DurableJob<VideoJob>, ctx) => {
+      // "job-backoff": a transient NON-step error (e.g. infra hiccup between
+      // steps). BullMQ's own attempts/backoff schedule the re-delivery — the
+      // instance parks as `yielded` and the jobs view shows attemptsMade=1/3.
+      if (job.data.mode === "job-backoff" && !failedOnce.has(job.data.id)) {
+        failedOnce.add(job.data.id)
+        throw new Error("redis connection reset by peer (transient infra error)")
+      }
+
       await ctx.log(`Starting generation for ${job.data.id}`, { mode: job.data.mode })
       const task = await ctx.step("create-provider-task", async () => ({
         taskId: `task_${job.data.id}`,
@@ -124,13 +174,57 @@ async function seedGeneration(redis: Redis): Promise<void> {
           throw new Error("Provider rejected the request: render quota exceeded")
         })
       }
+      if (job.data.mode === "flaky-step") {
+        // First attempt fails for real (auto step_retry event in the job log),
+        // the 300ms backoff parks the job briefly, the second attempt succeeds.
+        await ctx.step("call-upstream", { retry: { attempts: 3, backoff: 300 } }, async () => {
+          if (!failedOnce.has(job.data.id)) {
+            failedOnce.add(job.data.id)
+            throw new Error("upstream returned 502 Bad Gateway")
+          }
+          return { upstream: "ok", latencyMs: 89 }
+        })
+        await ctx.log("Upstream call recovered on attempt 2")
+      }
+      if (job.data.mode.startsWith("comp-")) {
+        // Saga showcase: two compensated steps, then a terminal failure.
+        await ctx.step(
+          "reserve-credits",
+          {
+            onRollback: {
+              handler: async () => {
+                await ctx.log("Refunding reserved credits")
+                if (job.data.mode === "comp-fail") {
+                  throw new Error("billing refund API returned 503")
+                }
+                if (job.data.mode === "comp-parked") {
+                  throw new Error("billing refund API timed out")
+                }
+              },
+              retry:
+                job.data.mode === "comp-parked"
+                  ? { attempts: 5, backoff: "10m" } // parks -> status "compensating"
+                  : { attempts: 2, backoff: 150 }, // fails fast -> compensation_failed
+            },
+          },
+          async () => ({ reservedCredits: 120 }),
+        )
+        await ctx.step(
+          "watermark-preview",
+          { onRollback: async () => void (await ctx.log("Removed preview watermark")) },
+          async () => ({ previewUrl: `https://cdn.example.com/prev/${job.data.id}.jpg` }),
+        )
+        await ctx.step("kyc-check", async () => {
+          throw ctx.nonRetryable("KYC verification rejected: sanctioned entity match")
+        })
+      }
       if (job.data.mode === "sleep") {
         await ctx.sleep("wait-for-render", "12m")
       }
       if (job.data.mode === "retry") {
         await ctx.step(
           "poll-provider",
-          { retry: { attempts: 50, backoff: "fixed", delay: "5m" } },
+          { retry: { attempts: 50, backoff: "5m" } },
           async () => {
             throw ctx.retryLater("provider still rendering")
           },
@@ -159,14 +253,26 @@ async function seedGeneration(redis: Redis): Promise<void> {
     mk("vid-complete-1", "complete"),
     mk("vid-complete-2", "complete"),
     mk("vid-complete-3", "complete"),
-    mk("vid-complete-4", "complete"),
+    mk("vid-flaky-1", "flaky-step"), // completes WITH a real step-retry history
     mk("vid-sleeping-1", "sleep"),
     mk("vid-sleeping-2", "sleep"),
     mk("vid-retrying-1", "retry"),
     mk("vid-failed-1", "fail"),
+    mk("vid-comp-ok-1", "comp-ok"), // failed, all compensations rolled back
+    mk("vid-comp-fail-1", "comp-fail"), // compensation_failed (refund kept failing)
+    mk("vid-comp-parked-1", "comp-parked"), // parked mid-compensation (10m backoff)
     mk("vid-cancel-1", "sleep"), // sleeps, then we cancel it below
   ]
   for (const job of jobs) await queue.add("video", job, { jobId: job.id })
+
+  // Transient non-step failure riding BullMQ's own retry budget: 3 attempts,
+  // 20m fixed backoff -> after the first failure the job sits `delayed` with
+  // attemptsMade=1 and the instance shows as waiting (derived from `yielded`).
+  await queue.add("video", mk("vid-backoff-1", "job-backoff"), {
+    jobId: "vid-backoff-1",
+    attempts: 3,
+    backoff: { type: "fixed", delay: 20 * 60 * 1000 },
+  })
 
   // Let the quick jobs complete and the long ones yield into sleeping/retrying.
   await sleep(4500)
@@ -174,17 +280,44 @@ async function seedGeneration(redis: Redis): Promise<void> {
   // Cancel the one we parked in `sleeping`.
   await queue.cancel("vid-cancel-1")
 
-  // An orphan resume job: a resume tick whose instance does not exist.
-  await queue.scheduleResume({
-    instanceId: "generation:vid-ghost-1",
+  // A legacy (0.1.x) orphan resume job: an in-flight envelope tick whose
+  // instance does not exist — exercises the rolling-upgrade health path.
+  await queue.bull.add(
+    "video",
+    {
+      __durable__: { instanceId: "generation:vid-ghost-1", originalJobId: "vid-ghost-1", resumeSeq: 1 },
+      payload: mk("vid-ghost-1", "complete"),
+    },
+    { jobId: "vid-ghost-1:resume:1", delay: 6 * 60 * 1000 },
+  )
+
+  // A legacy (0.1.x) run still CARRIED by its resume job across the rolling
+  // upgrade: instance has resumeSeq>0 and the delayed envelope job exists. The
+  // shim keeps advancing it; the jobs view links it via the envelope, and the
+  // log view merges the legacy list with the job log.
+  await writeRetrying(redis, {
+    instanceId: "generation:vid-legacy-1",
     queueName: "generation",
     jobName: "video",
-    jobData: mk("vid-ghost-1", "complete"),
-    originalJobId: "vid-ghost-1",
-    resumeSeq: 1,
-    delayMs: 6 * 60 * 1000,
-    reason: "sleep:wait-for-render",
+    originalJobId: "vid-legacy-1",
+    resumeSeq: 3,
+    input: mk("vid-legacy-1", "retry"),
+    completed: [{ key: "create-provider-task", result: { taskId: "task_vid-legacy-1" } }],
+    current: { key: "poll-provider", attempts: 3, nextRunInMs: 9 * 60 * 1000 },
+    logs: ["Starting generation for vid-legacy-1", "provider still rendering (legacy tick)"],
   })
+  await queue.bull.add(
+    "video",
+    {
+      __durable__: {
+        instanceId: "generation:vid-legacy-1",
+        originalJobId: "vid-legacy-1",
+        resumeSeq: 3,
+      },
+      payload: mk("vid-legacy-1", "retry"),
+    },
+    { jobId: "vid-legacy-1:resume:3", delay: 9 * 60 * 1000 },
+  )
 
   // A "running_stale" stuck instance: status=running with an old updatedAt.
   // Written directly through the documented durable layout.
@@ -271,6 +404,7 @@ async function writeStuckRunning(
       startedAt: old,
     }),
   )
+  await indexInstance(redis, opts.queueName, opts.instanceId, "active")
 }
 
 /**
@@ -291,6 +425,8 @@ async function writeRetrying(
     completed: Array<{ key: string; result: unknown }>
     current: { key: string; attempts: number; nextRunInMs: number }
     logs: string[]
+    /** Only for legacy (0.1.x) fixtures still carried by a resume job. */
+    resumeSeq?: number
   },
 ): Promise<void> {
   const now = Date.now()
@@ -303,7 +439,7 @@ async function writeRetrying(
     status: "yielded",
     input: JSON.stringify(opts.input),
     runCount: String(opts.current.attempts + 1),
-    resumeSeq: String(opts.current.attempts),
+    ...(opts.resumeSeq !== undefined ? { resumeSeq: String(opts.resumeSeq) } : {}),
     createdAt: String(createdAt),
     updatedAt: String(now),
   })
@@ -342,6 +478,7 @@ async function writeRetrying(
   if (logEntries.length) {
     await redis.rpush(`${DURABLE_PREFIX}:logs:${opts.instanceId}`, ...logEntries)
   }
+  await indexInstance(redis, opts.queueName, opts.instanceId, "active")
 }
 
 /**
@@ -418,6 +555,7 @@ async function writeCompletedRun(
   await redis.hset(`${DURABLE_PREFIX}:steps:${opts.instanceId}`, stepsHash)
   const logEntries = logs.sort((a, b) => a.timestamp - b.timestamp).map((l) => JSON.stringify(l))
   await redis.rpush(`${DURABLE_PREFIX}:logs:${opts.instanceId}`, ...logEntries)
+  await indexInstance(redis, opts.queueName, opts.instanceId, "completed", completedAt)
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +701,10 @@ interface MediaJob {
  * `retrying` instance and a `resume_missed` one.
  */
 async function seedMediaPipeline(redis: Redis): Promise<void> {
-  const queue = new DurableQueue<MediaJob>("media", { connection })
+  const queue = new DurableQueue<MediaJob>("media", {
+    connection,
+    defaultJobOptions: { keepLogs: 200 },
+  })
   const worker = new DurableWorker(
     "media",
     async (job: DurableJob<MediaJob>, ctx) => {
@@ -654,18 +795,16 @@ async function seedMediaPipeline(redis: Redis): Promise<void> {
       "Encoder busy — retrying",
     ],
   })
-  await queue.scheduleResume({
-    instanceId: "media:movie-770",
-    queueName: "media",
-    jobName: "encode",
-    jobData: { id: "movie-770", mode: "complete" },
-    originalJobId: "movie-770",
-    resumeSeq: 14,
-    delayMs: 90_000,
-    reason: "retry:poll-encoder",
+  // 0.2.x: the run rides ONE job — a retrying instance's carrier is its own
+  // job parked in the delayed set.
+  await queue.bull.add("encode", { id: "movie-770", mode: "complete" }, {
+    jobId: "movie-770",
+    delay: 90_000,
   })
 
-  // A `resume_missed` instance: nextRunAt is well in the past (no live resume).
+  // A `resume_missed` instance: its carrier job EXISTS (delayed, so no orphan
+  // flag) but the step's nextRunAt is 42 minutes overdue — the "delivery never
+  // fired when due" stuck kind.
   await writeRetrying(redis, {
     instanceId: "media:movie-771",
     queueName: "media",
@@ -675,6 +814,25 @@ async function seedMediaPipeline(redis: Redis): Promise<void> {
     completed: [{ key: "probe-source", result: { container: "mkv", codec: "av1" } }],
     current: { key: "poll-encoder", attempts: 9, nextRunInMs: -42 * 60 * 1000 },
     logs: ["Encode request for movie-771", "Encoder busy — retrying"],
+  })
+  await queue.bull.add(
+    "encode",
+    { id: "movie-771", mode: "complete" },
+    { jobId: "movie-771", delay: 12 * 60 * 60 * 1000 },
+  )
+
+  // An `orphan_instance`: a non-terminal (yielded) run whose carrier job is
+  // GONE — someone hand-deleted it / bulk-cleaned the delayed set. Health
+  // flags it; the reconcile pass would cancel+reap it once a worker runs.
+  await writeRetrying(redis, {
+    instanceId: "media:movie-772",
+    queueName: "media",
+    jobName: "encode",
+    originalJobId: "movie-772",
+    input: { id: "movie-772", mode: "complete" },
+    completed: [{ key: "probe-source", result: { container: "mp4", codec: "h265" } }],
+    current: { key: "poll-encoder", attempts: 4, nextRunInMs: 3 * 60 * 1000 },
+    logs: ["Encode request for movie-772", "Encoder busy — retrying"],
   })
 
   // A pristine *completed* multi-step run — the clearest showcase of the
@@ -1011,9 +1169,14 @@ async function main(): Promise<void> {
       "  Schedulers   : emails (daily-digest cron, heartbeat interval), payments (nightly-reconcile cron)\n" +
       "  Metrics      : emails, payments, checkout (~2h of completed/failed throughput)\n" +
       "  Alerts       : 4 active rules (payments-failed, backlog, no-workers, durable-stuck)\n" +
-      "  Durable      : generation (completed×4, sleeping×2, retrying, failed, cancelled, stuck, orphan)\n" +
-      "                 exports (completed×2, sleeping)\n" +
-      "                 media (6-step pipeline: completed×2, sleeping, failed, retrying×1, resume-missed×1)\n" +
+      "  Durable      : generation — completed×3, flaky-step retry history, sleeping×2, retrying,\n" +
+      "                 failed, comp-ok (failed+rolled-back), compensation_failed, compensating (parked),\n" +
+      "                 job-backoff (waiting on BullMQ attempts), cancelled, running_stale,\n" +
+      "                 legacy orphan resume job + legacy shim-carried run\n" +
+      "                 exports — completed×2, sleeping\n" +
+      "                 media — 6-step pipeline: completed×2 (+ waterfall showcase), sleeping,\n" +
+      "                 failed (deep in transcode), retrying (live carrier), resume_missed (overdue),\n" +
+      "                 orphan_instance (carrier deleted)\n" +
       "  Next: pnpm --filter bullmq-cockpit dev   → http://localhost:3010\n\n",
   )
   process.exit(0)

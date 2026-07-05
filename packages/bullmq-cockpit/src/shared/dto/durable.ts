@@ -132,6 +132,18 @@ export interface DurableLogEntry {
   message: string
   meta?: Record<string, unknown>
   timestamp: number
+  /** `"log"` user entry / `"event"` runtime failure-path event / `"raw"` foreign job.log line. */
+  kind?: "log" | "event" | "raw"
+  /** Which delivery of the run emitted this (1-based). */
+  runCount?: number
+  /** Which BullMQ attempt cycle (real failures only). */
+  jobAttempt?: number
+  /** Step attribution, when emitted inside a step. */
+  step?: string
+  stepAttempt?: number
+  /** Runtime event code (kind === "event"). */
+  event?: string
+  err?: { name: string; message: string }
 }
 
 /** A unified, chronological timeline entry synthesized from steps + logs. */

@@ -139,8 +139,9 @@ export class DurableBullModule {
         new DurableQueue(name, {
           connection: root.connection,
           durablePrefix: reg.durablePrefix ?? root.durablePrefix,
-          bullPrefix: reg.bullPrefix ?? root.bullPrefix,
-          defaultJobOptions: reg.defaultJobOptions,
+          // `bullPrefix` is the deprecated 0.1.x alias for BullMQ's `prefix`.
+          prefix: reg.prefix ?? reg.bullPrefix ?? root.prefix ?? root.bullPrefix,
+          defaultJobOptions: reg.defaultJobOptions ?? root.defaultJobOptions,
           stateStore: reuseSharedStore(shared, root, reg.durablePrefix),
         }),
       inject: [

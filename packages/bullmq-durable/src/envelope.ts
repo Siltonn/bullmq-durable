@@ -1,11 +1,14 @@
 /**
- * Resume-job envelopes.
+ * LEGACY (0.1.x) resume-job envelopes — kept only as a rolling-upgrade shim.
  *
- * A durable instance outlives a single BullMQ job. When the runtime schedules a
- * resume tick it enqueues a *new* BullMQ job (with a new id), so it must carry
- * the original instance id alongside the user payload. That is done with a tiny
- * envelope keyed by a reserved field; the worker unwraps it before handing the
- * job to the processor, so user code only ever sees its own payload.
+ * 0.1.x advanced a run by enqueuing new "resume" jobs whose data wrapped the
+ * user payload with durable metadata. 0.2.0 has no resume jobs (a run rides one
+ * BullMQ job via `moveToDelayed`), but an upgraded worker may still receive
+ * in-flight 0.1.x resume jobs — some sleep for days. The worker detects the
+ * envelope, unwraps it, and keeps advancing the ORIGINAL instance; the legacy
+ * job simply becomes the run's carrier under the new mechanics.
+ *
+ * @deprecated Internal shim. Not exported from the package root. Removed in 0.3.0.
  */
 
 /** Reserved key used to carry durable metadata on resume jobs. */

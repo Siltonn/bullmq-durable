@@ -10,8 +10,9 @@ const ok: ActionResult = { ok: true }
 export const jobsRouter = router({
   list: protectedProcedure("job:read")
     .input(jobListInput)
-    .query(({ ctx, input }) => {
+    .query(async ({ ctx, input }) => {
       const { queueName, ...query } = input
+      await ctx.board.requireQueue(queueName)
       return ctx.board.bullmq.listJobs(queueName, query)
     }),
 
@@ -19,6 +20,7 @@ export const jobsRouter = router({
     .input(addJobInput)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
       const { queueName, ...body } = input
+      await ctx.board.requireQueue(queueName)
       const { id } = await ctx.board.bullmq.addJob(queueName, body)
       return { ok: true, message: `Job ${id} added` }
     }),
@@ -26,6 +28,7 @@ export const jobsRouter = router({
   get: protectedProcedure("job:read")
     .input(jobParam)
     .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
       const detail = await ctx.board.bullmq.getJob(input.queueName, input.jobId)
       if (!detail) throw notFound(`Job "${input.jobId}" not found`)
       return detail
@@ -33,11 +36,15 @@ export const jobsRouter = router({
 
   logs: protectedProcedure("job:read")
     .input(jobParam)
-    .query(({ ctx, input }) => ctx.board.bullmq.getJobLogs(input.queueName, input.jobId)),
+    .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
+      return ctx.board.bullmq.getJobLogs(input.queueName, input.jobId)
+    }),
 
   dependencies: protectedProcedure("job:read")
     .input(jobParam)
     .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
       const deps = await ctx.board.bullmq.getJobDependencies(input.queueName, input.jobId)
       if (!deps) throw notFound(`Job "${input.jobId}" not found`)
       return deps
@@ -46,6 +53,7 @@ export const jobsRouter = router({
   flow: protectedProcedure("job:read")
     .input(jobParam)
     .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
       const flow = await ctx.board.bullmq.getJobFlow(input.queueName, input.jobId)
       if (!flow) throw notFound(`Job "${input.jobId}" not found`)
       return flow
@@ -54,6 +62,7 @@ export const jobsRouter = router({
   duplicate: protectedProcedure("job:write")
     .input(jobParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       const { id } = await ctx.board.bullmq.duplicateJob(input.queueName, input.jobId)
       return { ok: true, message: `Duplicated as job ${id}` }
     }),
@@ -61,6 +70,7 @@ export const jobsRouter = router({
   retry: protectedProcedure("job:write")
     .input(jobParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.retryJob(input.queueName, input.jobId)
       return ok
     }),
@@ -68,6 +78,7 @@ export const jobsRouter = router({
   promote: protectedProcedure("job:write")
     .input(jobParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.promoteJob(input.queueName, input.jobId)
       return ok
     }),
@@ -75,6 +86,7 @@ export const jobsRouter = router({
   remove: protectedProcedure("job:write")
     .input(jobParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.removeJob(input.queueName, input.jobId)
       return ok
     }),
@@ -82,6 +94,7 @@ export const jobsRouter = router({
   bulkRetry: protectedProcedure("job:write")
     .input(bulkJobsInput)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       const result = await ctx.board.bullmq.retryJobs(input.queueName, input.ids)
       return { ok: true, message: `Retried ${result.ok} job(s)` }
     }),
@@ -89,6 +102,7 @@ export const jobsRouter = router({
   bulkRemove: protectedProcedure("job:write")
     .input(bulkJobsInput)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       const result = await ctx.board.bullmq.removeJobs(input.queueName, input.ids)
       return { ok: true, message: `Removed ${result.ok} job(s)` }
     }),

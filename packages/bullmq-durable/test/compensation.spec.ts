@@ -97,7 +97,7 @@ describe("rollback failure → compensation_failed", () => {
     const { outcome, instance } = await engine.run("job", {}, "1")
 
     expect(outcome.type).toBe("failed")
-    expect((outcome as { compensationFailed?: boolean }).compensationFailed).toBe(true)
+    // The distinction lives in durable state (BullMQ has no third terminal state).
     expect(instance?.status).toBe("compensation_failed")
     // b failed but a still ran (independent undos).
     expect(order).toEqual(["undo-b", "undo-a"])
@@ -252,3 +252,50 @@ describe("cancellation bypasses settlement", () => {
     expect(onFailureCalled).toBe(0)
   })
 })
+
+describe("resumed compensation never completes the run (hardening)", () => {
+  it("routes back into the failure sequence even when the forward replay succeeds", async () => {
+    let forwardCalls = 0
+    let undoCalls = 0
+    const engine = new TestEngine(
+      async (_job: DurableJob, ctx: DurableContext) => {
+        await ctx.step(
+          "a",
+          {
+            onRollback: {
+              handler: () => {
+                undoCalls++
+                if (undoCalls === 1) throw new Error("undo transient")
+              },
+              retry: { attempts: 2, backoff: "5s" },
+            },
+          },
+          async () => "a-done",
+        )
+        forwardCalls++
+        // Flaky NON-step section: fails on the first tick only. On the
+        // compensation resume the replay would "succeed" — which must NOT
+        // complete a run that already entered its failure sequence.
+        if (forwardCalls === 1) throw new Error("flaky section")
+        return "should-never-be-stored"
+      },
+      { queueName: "harden" },
+    )
+
+    // Tick 1: step a completes, forward fails, compensation attempt 1 fails
+    // and suspends with the instance still `compensating`.
+    await engine.start("job", {}, "1")
+    expect((await engine.store.getInstance(engine.instanceId("1")))?.status).toBe("compensating")
+
+    // Tick 2: forward replay now "succeeds" — the run must STILL settle failed.
+    const { last } = await engine.drain()
+    expect(last?.type).toBe("failed")
+
+    const instance = await engine.store.getInstance(engine.instanceId("1"))
+    expect(instance?.status).toBe("failed")
+    expect(instance?.output).toBeUndefined()
+    expect(instance?.compensation?.rolledBack).toEqual(["a"])
+    expect(undoCalls).toBe(2)
+  })
+})
+

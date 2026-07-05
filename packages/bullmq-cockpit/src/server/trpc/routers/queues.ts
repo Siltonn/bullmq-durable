@@ -20,12 +20,16 @@ export const queuesRouter = router({
 
   metrics: protectedProcedure("queue:read")
     .input(queueParam)
-    .query(({ ctx, input }) => ctx.board.bullmq.getMetrics(input.queueName)),
+    .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
+      return ctx.board.bullmq.getMetrics(input.queueName)
+    }),
 
   // Derived activity: throughput + latency + per-job-name, from recent jobs.
   activity: protectedProcedure("queue:read")
     .input(queueActivityInput)
-    .query(({ ctx, input }) => {
+    .query(async ({ ctx, input }) => {
+      await ctx.board.requireQueue(input.queueName)
       const w = input.windowMinutes
       const windowMinutes = w && w > 0 ? Math.min(720, w) : 30
       return ctx.board.bullmq.queueActivity(input.queueName, windowMinutes)
@@ -34,6 +38,7 @@ export const queuesRouter = router({
   pause: protectedProcedure("queue:write")
     .input(queueParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.pauseQueue(input.queueName)
       return ok
     }),
@@ -41,6 +46,7 @@ export const queuesRouter = router({
   resume: protectedProcedure("queue:write")
     .input(queueParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.resumeQueue(input.queueName)
       return ok
     }),
@@ -50,6 +56,7 @@ export const queuesRouter = router({
     .input(cleanQueueInput)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
       const { queueName, ...body } = input
+      await ctx.board.requireQueue(queueName)
       await ctx.board.bullmq.cleanQueue(queueName, body)
       return ok
     }),
@@ -57,6 +64,7 @@ export const queuesRouter = router({
   drain: protectedProcedure("dangerous:write")
     .input(queueParam)
     .mutation(async ({ ctx, input }): Promise<ActionResult> => {
+      await ctx.board.requireQueue(input.queueName)
       await ctx.board.bullmq.drainQueue(input.queueName)
       return ok
     }),

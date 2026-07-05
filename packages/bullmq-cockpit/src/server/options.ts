@@ -8,10 +8,10 @@
 
 import type { ConnectionOptions } from "bullmq"
 import type { BoardPermission, BoardUser } from "../shared/dto"
-import { DEFAULT_DURABLE_PREFIX } from "./durable/protocol"
+import { DEFAULT_DURABLE_PREFIX } from "bullmq-durable"
 
 /** The cockpit's own version string, surfaced in the UI footer. */
-export const COCKPIT_VERSION = "0.1.4"
+export const COCKPIT_VERSION = "0.2.0"
 
 /** Default "stale" threshold for stuck detection: 5 minutes. */
 export const DEFAULT_STUCK_THRESHOLD_MS = 5 * 60 * 1000
@@ -175,6 +175,13 @@ const allowAll: AuthHandler = () => true
 export function normalizeOptions(options: BullMQCockpitOptions): NormalizedCockpitOptions {
   if (!options.connection) {
     throw new Error("bullmq-cockpit: `connection` is required")
+  }
+
+  if (!options.auth && !options.readonly) {
+    console.warn(
+      "bullmq-cockpit: no `auth` configured — every request gets full (write) access. " +
+        "Set `auth` (or at least `readonly: true`) before exposing the dashboard beyond localhost.",
+    )
   }
 
   return {

@@ -17,12 +17,21 @@ import { type BullMQInspector, createBullMQInspector } from "./inspectors/bullmq
 import { DurableInspector } from "./inspectors/durable-inspector"
 import { HealthInspector } from "./inspectors/health-inspector"
 import type { NormalizedCockpitOptions } from "./options"
+import { notFound } from "./http/http-error"
 import { createRedisClient } from "./infra/redis"
 
 export interface BoardContext {
   options: NormalizedCockpitOptions
   redis: Redis
+  /** Resolve a Queue for a TRUSTED name (discovered, or read from our own state). */
   getQueue: (name: string) => Queue
+  /**
+   * Validate a CLIENT-SUPPLIED queue name against the discovered/allow-listed
+   * set, then resolve its Queue. Throws 404 for unknown names — instantiating a
+   * BullMQ Queue for an arbitrary name would write its meta keys into Redis
+   * (keyspace pollution) and grow the queue cache without bound.
+   */
+  requireQueue: (name: string) => Promise<Queue>
   bullmq: BullMQInspector
   durable?: DurableInspector
   health: HealthInspector
@@ -78,6 +87,26 @@ export function createBoardContext(options: NormalizedCockpitOptions): BoardCont
     durableEnabled: options.durable.enabled,
   })
 
+  // Known-queue gate for client-supplied names. Discovery is cached briefly so
+  // hot paths don't re-SCAN; a miss retries once uncached (a queue created
+  // moments ago must not 404 for the cache window).
+  const KNOWN_QUEUES_TTL_MS = 5_000
+  let knownQueues: { names: Set<string>; at: number } | undefined
+  const requireQueue = async (name: string): Promise<Queue> => {
+    if (!queues.has(name)) {
+      if (!knownQueues || Date.now() - knownQueues.at > KNOWN_QUEUES_TTL_MS) {
+        knownQueues = { names: new Set(await bullmq.queueNames()), at: Date.now() }
+      }
+      if (!knownQueues.names.has(name)) {
+        knownQueues = { names: new Set(await bullmq.queueNames()), at: Date.now() }
+        if (!knownQueues.names.has(name)) {
+          throw notFound(`Queue "${name}" not found`)
+        }
+      }
+    }
+    return getQueue(name)
+  }
+
   // The background notifier (ok→firing dispatch). The dashboard evaluates live
   // regardless; this only powers channel notifications.
   let scheduler: AlertScheduler | undefined
@@ -87,8 +116,12 @@ export function createBoardContext(options: NormalizedCockpitOptions): BoardCont
 
   const close = async (): Promise<void> => {
     scheduler?.stop()
-    await Promise.allSettled([...[...queues.values()].map((q) => q.close()), redis.quit()])
+    await Promise.allSettled([
+      durable?.close() ?? Promise.resolve(),
+      ...[...queues.values()].map((q) => q.close()),
+      redis.quit(),
+    ])
   }
 
-  return { options, redis, getQueue, bullmq, durable, health, alerts, close }
+  return { options, redis, getQueue, requireQueue, bullmq, durable, health, alerts, close }
 }
