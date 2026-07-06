@@ -88,22 +88,31 @@ export function createJobInspector(deps: BullMQInspectorDeps) {
     return job
   }
 
+  /** Retry one job, durable-aware: a terminal-failed run re-drives through the
+   *  runtime (a bare `job.retry()` would only replay the stored failure);
+   *  everything else — including non-terminal runs, which a plain retry
+   *  genuinely continues — takes the BullMQ path. */
+  const retryOne = async (queueName: string, jobId: string): Promise<void> => {
+    if (durable && (await durable.retryRun(queueName, jobId))) return
+    await retryFromCurrentState(await requireJob(queueName, jobId))
+  }
+
+  /** Remove one job, durable-aware: a job carrying a run is deleted through the
+   *  runtime (state + carrier jobs) so no orphan state lingers. */
+  const removeOne = async (queueName: string, jobId: string): Promise<void> => {
+    if (durable && (await durable.deleteRun(queueName, jobId))) return
+    await (await requireJob(queueName, jobId)).remove()
+  }
+
   const bulk = async (
-    queueName: string,
     ids: string[],
-    op: (job: Job) => Promise<unknown>,
+    op: (jobId: string) => Promise<void>,
   ): Promise<{ ok: number; failed: number }> => {
-    const queue = getQueue(queueName)
     let ok = 0
     let failed = 0
     for (const id of ids) {
       try {
-        const job = await queue.getJob(id)
-        if (!job) {
-          failed++
-          continue
-        }
-        await op(job)
+        await op(id)
         ok++
       } catch {
         failed++
@@ -210,7 +219,7 @@ export function createJobInspector(deps: BullMQInspectorDeps) {
     },
 
     async retryJob(queueName: string, jobId: string): Promise<void> {
-      await retryFromCurrentState(await requireJob(queueName, jobId))
+      await retryOne(queueName, jobId)
     },
 
     async promoteJob(queueName: string, jobId: string): Promise<void> {
@@ -218,7 +227,7 @@ export function createJobInspector(deps: BullMQInspectorDeps) {
     },
 
     async removeJob(queueName: string, jobId: string): Promise<void> {
-      await (await requireJob(queueName, jobId)).remove()
+      await removeOne(queueName, jobId)
     },
 
     /** Re-add a job with the same name + data (a fresh id is generated). */
@@ -235,11 +244,11 @@ export function createJobInspector(deps: BullMQInspectorDeps) {
     },
 
     retryJobs(queueName: string, ids: string[]): Promise<{ ok: number; failed: number }> {
-      return bulk(queueName, ids, (job) => retryFromCurrentState(job))
+      return bulk(ids, (id) => retryOne(queueName, id))
     },
 
     removeJobs(queueName: string, ids: string[]): Promise<{ ok: number; failed: number }> {
-      return bulk(queueName, ids, (job) => job.remove())
+      return bulk(ids, (id) => removeOne(queueName, id))
     },
   }
 }

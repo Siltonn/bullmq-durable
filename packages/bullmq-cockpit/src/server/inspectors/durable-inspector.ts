@@ -379,6 +379,14 @@ export class DurableInspector {
   ): Promise<void> {
     const run = await this.resolveRun(instanceId)
     if (!run) throw notFound(`Durable instance "${instanceId}" not found`)
+    await this.runAction(run, invoke)
+  }
+
+  /** Run one durable action, mapping {@link DurableActionError} onto HTTP errors. */
+  private async runAction(
+    run: DurableRun,
+    invoke: (run: DurableRun) => Promise<void>,
+  ): Promise<void> {
     try {
       await invoke(run)
     } catch (error) {
@@ -387,6 +395,60 @@ export class DurableInspector {
       }
       throw error
     }
+  }
+
+  // -- Durable-aware routing for the BullMQ surfaces --------------------------
+  // The plain queue/job inspectors route through these when durable is enabled,
+  // so maintenance done from the BullMQ pages keeps run state in lockstep with
+  // the jobs (state follows the job). Queues without durable state pass through
+  // unchanged — the durable follow-ups are no-ops on an empty index.
+
+  /** `Queue.drain` + reconcile/reap of the orphaned non-terminal run state. */
+  async drainQueue(queueName: string): Promise<void> {
+    await this.queueFor(queueName).drain()
+  }
+
+  /** `Queue.clean` + exact state removal for the cleaned jobs. */
+  async cleanQueue(
+    queueName: string,
+    graceMs: number,
+    limit: number,
+    status?: Parameters<Queue["clean"]>[2],
+  ): Promise<void> {
+    await this.queueFor(queueName).clean(graceMs, limit, status)
+  }
+
+  /**
+   * Durable-aware job retry: a run in a terminal-failure status is re-driven
+   * through the runtime — a bare `job.retry()` would only replay the stored
+   * failure without re-running any business code. Returns `false` when the job
+   * carries no such run (including non-terminal ones, where the plain BullMQ
+   * retry IS the correct continuation) — the caller falls back.
+   */
+  async retryRun(queueName: string, jobId: string): Promise<boolean> {
+    const queue = this.queueFor(queueName)
+    const state = await this.store.getInstance(queue.instanceIdFor(jobId))
+    if (state?.status !== "failed" && state?.status !== "compensation_failed") return false
+    // Unseeded handle: the action re-reads state, so a concurrent transition
+    // surfaces as invalid_state instead of acting on a stale snapshot.
+    await this.runAction(queue.run(jobId), (run) =>
+      state.status === "failed" ? run.retry() : run.retryCompensation(),
+    )
+    return true
+  }
+
+  /**
+   * Durable-aware job removal: a job that carries a run is deleted through the
+   * runtime (state + carrier jobs), so no orphan state lingers. Returns `false`
+   * when the job has no durable state — the caller falls back to a plain
+   * `job.remove()`.
+   */
+  async deleteRun(queueName: string, jobId: string): Promise<boolean> {
+    const queue = this.queueFor(queueName)
+    const state = await this.store.getInstance(queue.instanceIdFor(jobId))
+    if (!state) return false
+    await this.runAction(queue.run(jobId, state), (run) => run.delete())
+    return true
   }
 
   // -- Internals -----------------------------------------------------------
