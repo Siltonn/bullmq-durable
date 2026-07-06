@@ -88,7 +88,10 @@ end
 //
 // KEYS: [1] instance.
 // ARGV: named in the header line; [CREATE_FIELDS_FROM..] HSET pairs for creation.
-const BEGIN_TICK_SCRIPT = LUA_DUMP_HASH + LUA_CLEAR_DONE_BUCKETS + `
+const BEGIN_TICK_SCRIPT =
+  LUA_DUMP_HASH +
+  LUA_CLEAR_DONE_BUCKETS +
+  `
 local id, now, prefix, queueName = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 local CREATE_FIELDS_FROM = 5
 local idx = prefix .. ':idx:' .. queueName
@@ -124,7 +127,9 @@ return {'created', ''}
 // patch: terminal statuses leave the active set and enter their done-bucket;
 // running/yielded/compensating stays active (SADD is idempotent, covering the
 // backfill case where an in-flight instance wasn't yet indexed).
-const UPDATE_SCRIPT = LUA_CLEAR_DONE_BUCKETS + `
+const UPDATE_SCRIPT =
+  LUA_CLEAR_DONE_BUCKETS +
+  `
 local id, newStatus, score, prefix = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 local PATCH_FIELDS_FROM = 5
 if redis.call('EXISTS', KEYS[1]) == 0 then
@@ -299,10 +304,7 @@ export class RedisStateStore implements StateStore {
     })
 
     if (outcome === "created") return fresh
-    return parseInstance(
-      JSON.parse(dumped) as Record<string, string>,
-      input.instanceId,
-    )
+    return parseInstance(JSON.parse(dumped) as Record<string, string>, input.instanceId)
   }
 
   async getInstance(instanceId: string): Promise<InstanceState | null> {
@@ -668,9 +670,10 @@ export class RedisStateStore implements StateStore {
     // bucket. Treat this queue's filtered leftovers as appended AFTER the
     // per-queue bucket — same convention as the window reads.
     const legacyAll = (
-      await (order === "asc"
-        ? this.redis.zrange(legacyTerminalIndexKey(this.prefix, status), 0, -1)
-        : this.redis.zrevrange(legacyTerminalIndexKey(this.prefix, status), 0, -1)
+      await (
+        order === "asc"
+          ? this.redis.zrange(legacyTerminalIndexKey(this.prefix, status), 0, -1)
+          : this.redis.zrevrange(legacyTerminalIndexKey(this.prefix, status), 0, -1)
       ).catch(() => [] as string[])
     ).filter((id) => id.startsWith(`${queueName}:`))
     if (legacyAll.length === 0) return primary
@@ -703,7 +706,11 @@ export class RedisStateStore implements StateStore {
     const out: DurableLogEntry[] = []
     for (const line of raw) {
       try {
-        const parsed = JSON.parse(line) as { message?: string; timestamp?: number; meta?: Record<string, unknown> }
+        const parsed = JSON.parse(line) as {
+          message?: string
+          timestamp?: number
+          meta?: Record<string, unknown>
+        }
         if (typeof parsed.message === "string") {
           out.push({
             message: parsed.message,
@@ -747,9 +754,7 @@ export class RedisStateStore implements StateStore {
     // jobs — never materialise it in one array.
     const CHUNK = 500
     for (;;) {
-      const ids = new Set<string>(
-        await this.redis.smembers(activeIndexKey(this.prefix, queueName)),
-      )
+      const ids = new Set<string>(await this.redis.smembers(activeIndexKey(this.prefix, queueName)))
       for (const status of TERMINAL_STATUSES) {
         for (const id of await this.redis.zrange(
           terminalIndexKey(this.prefix, queueName, status),

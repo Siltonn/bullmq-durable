@@ -8,7 +8,8 @@
 import type { ModuleMetadata, Type } from "@nestjs/common"
 import type { ConnectionOptions, JobsOptions, WorkerOptions } from "bullmq"
 import type { StateStore } from "../store/state-store"
-import type { DurableReaperConfig,
+import type {
+  DurableReaperConfig,
   DurableProcessorInput,
   DurableWorkerOptions,
   RetentionOptions,

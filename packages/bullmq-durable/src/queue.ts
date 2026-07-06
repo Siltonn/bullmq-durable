@@ -20,7 +20,11 @@
  */
 
 import { type JobsOptions, Queue, type QueueOptions } from "bullmq"
-import { summarizeInstances, type DurableRunSummary, type SummarizeOptions } from "./inspect/summarize"
+import {
+  summarizeInstances,
+  type DurableRunSummary,
+  type SummarizeOptions,
+} from "./inspect/summarize"
 import { bullJobKeysExist, DurableReaper } from "./reaper"
 import { DurableRun, removeCarrierJobs, type DurableRunContext } from "./run"
 import { RedisStateStore } from "./store/redis-store"

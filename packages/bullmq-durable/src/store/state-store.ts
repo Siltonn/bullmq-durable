@@ -157,11 +157,7 @@ export interface StateStore {
   listActive(queueName: string): Promise<string[]>
 
   /** The oldest `limit` ids in a queue's terminal bucket (oldest first). */
-  listOldestTerminal(
-    queueName: string,
-    status: TerminalStatus,
-    limit: number,
-  ): Promise<string[]>
+  listOldestTerminal(queueName: string, status: TerminalStatus, limit: number): Promise<string[]>
 
   /** The newest `limit` ids in a queue's terminal bucket (newest first). */
   /**
@@ -174,11 +170,7 @@ export interface StateStore {
     query: { offset: number; limit: number; order: "asc" | "desc" },
   ): Promise<string[]>
 
-  listNewestTerminal(
-    queueName: string,
-    status: TerminalStatus,
-    limit: number,
-  ): Promise<string[]>
+  listNewestTerminal(queueName: string, status: TerminalStatus, limit: number): Promise<string[]>
 
   /** Exact cardinality of a queue's terminal bucket. */
   countTerminal(queueName: string, status: TerminalStatus): Promise<number>

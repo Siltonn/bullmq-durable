@@ -155,7 +155,6 @@ export class DurableReaper {
     ])
     return alive === true
   }
-
 }
 
 type ExistsCapable = { exists(key: string): Promise<number | string> }
@@ -214,4 +213,3 @@ export function bullJobKeysExist(base: {
     )
   }
 }
-

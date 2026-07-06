@@ -123,8 +123,11 @@ export class HealthInspector {
         // runtime package — one source of truth for "which job carries a run".
         const state = await this.durable.carrierState(s.queueName, s.originalJobId)
         const healthy =
-          state === "delayed" || state === "waiting" || state === "prioritized" ||
-          state === "active" || state === "waiting-children"
+          state === "delayed" ||
+          state === "waiting" ||
+          state === "prioritized" ||
+          state === "active" ||
+          state === "waiting-children"
         if (!healthy) {
           found.push({
             kind: "orphan_instance",

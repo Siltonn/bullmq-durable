@@ -309,11 +309,7 @@ describe("stall settlement (mode: settle)", () => {
     const rolledBack: string[] = []
     let bRuns = 0
     const processor = async (_job: DurableJob, ctx: DurableContext) => {
-      await ctx.step(
-        "a",
-        { onRollback: () => void rolledBack.push("a") },
-        async () => "a-result",
-      )
+      await ctx.step("a", { onRollback: () => void rolledBack.push("a") }, async () => "a-result")
       await ctx.step("b", async () => {
         bRuns += 1
         return await new Promise(() => undefined) // hangs; the process "dies" here

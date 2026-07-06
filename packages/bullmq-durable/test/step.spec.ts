@@ -220,4 +220,3 @@ describe("concurrent steps (Promise.all)", () => {
     expect(last?.type).toBe("completed")
   })
 })
-

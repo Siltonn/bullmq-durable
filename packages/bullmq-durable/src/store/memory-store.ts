@@ -14,12 +14,7 @@
 import type { InstanceState, StepState } from "../types"
 import { isTerminalStatus, type TerminalStatus } from "../utils/keys"
 import { cloneValue, serializeError } from "../utils/serialize"
-import type {
-  BeginStepInit,
-  BeginStepResult,
-  InitInstanceInput,
-  StateStore,
-} from "./state-store"
+import type { BeginStepInit, BeginStepResult, InitInstanceInput, StateStore } from "./state-store"
 
 interface InstanceRecord {
   instance: InstanceState

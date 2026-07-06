@@ -323,7 +323,9 @@ export class StepExecutor {
 
     if (attempts < maxAttempts) {
       const delayMs =
-        isRetryLater && error.delayMs !== undefined ? error.delayMs : computeBackoff(retry, attempts)
+        isRetryLater && error.delayMs !== undefined
+          ? error.delayMs
+          : computeBackoff(retry, attempts)
 
       if (!isRetryLater) {
         void this.deps.emitEvent("step_retry", {

@@ -298,4 +298,3 @@ describe("resumed compensation never completes the run (hardening)", () => {
     expect(undoCalls).toBe(2)
   })
 })
-

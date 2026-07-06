@@ -10,11 +10,7 @@
  * needing to store it.
  */
 
-import type {
-  DurableInstanceDetail,
-  DurableInstanceSummary,
-  DurableStep,
-} from "../../shared/dto"
+import type { DurableInstanceDetail, DurableInstanceSummary, DurableStep } from "../../shared/dto"
 import {
   classifyLocalStuck,
   deriveView,

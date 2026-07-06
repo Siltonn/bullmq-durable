@@ -300,4 +300,3 @@ describe("DurableRun", () => {
     await expect(queue.run("ghost").retry()).rejects.toMatchObject({ code: "not_found" })
   })
 })
-

@@ -278,7 +278,12 @@ describe("MemoryStateStore", () => {
 
     it("removeInstances deletes state and locks", async () => {
       await init(store)
-      await store.saveStep(INSTANCE, "a", { key: "a", type: "step", status: "completed", attempts: 1 })
+      await store.saveStep(INSTANCE, "a", {
+        key: "a",
+        type: "step",
+        status: "completed",
+        attempts: 1,
+      })
       await store.completeInstance(INSTANCE, "done")
 
       await store.removeInstances("test", [INSTANCE])

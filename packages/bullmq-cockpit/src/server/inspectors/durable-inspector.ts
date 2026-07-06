@@ -150,11 +150,7 @@ export class DurableInspector {
 
     // Terminal statuses get REAL pagination (zset offset pages), not a window.
     if (isTerminal && !query.stuckOnly) {
-      return this.listTerminalInstances(
-        status as (typeof TERMINAL_STATUSES)[number],
-        query,
-        page,
-      )
+      return this.listTerminalInstances(status as (typeof TERMINAL_STATUSES)[number], query, page)
     }
 
     // Non-terminal / mixed listings read the (bounded) active population,
