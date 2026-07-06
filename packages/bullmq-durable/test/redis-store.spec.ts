@@ -10,7 +10,7 @@ import { Redis } from "ioredis"
 import { afterAll, describe, expect, it } from "vitest"
 import type { DurableContext, DurableJob } from "../src/index"
 import { DurableQueue } from "../src/index"
-import { DurableReaper, bullJobsExist } from "../src/reaper"
+import { DurableReaper, bullJobKeysExist } from "../src/reaper"
 import { RedisStateStore } from "../src/store/redis-store"
 import type { StepState } from "../src/types"
 import { TestEngine } from "./helpers/engine"
@@ -333,6 +333,47 @@ describeRedis("RedisStateStore (integration)", () => {
       expect((await store.listOldestTerminal("q", "completed", 10)).includes(b)).toBe(true)
     })
 
+    it("listTerminalPage slices one bucket by offset, both orders", async () => {
+      const ids: string[] = []
+      for (let i = 0; i < 4; i++) {
+        const id = newId()
+        ids.push(id)
+        await init(id)
+        await store.completeInstance(id, i)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+
+      const newestFirst = await store.listTerminalPage("q", "completed", {
+        offset: 0,
+        limit: 2,
+        order: "desc",
+      })
+      const nextPage = await store.listTerminalPage("q", "completed", {
+        offset: 2,
+        limit: 2,
+        order: "desc",
+      })
+      // Pages are disjoint, ordered newest-first, and our 4 runs land in the
+      // union in reverse completion order (other tests may add older entries).
+      expect(newestFirst).toHaveLength(2)
+      expect(newestFirst.some((id) => nextPage.includes(id))).toBe(false)
+      expect([...newestFirst, ...nextPage].slice(0, 4)).toEqual([...ids].reverse())
+
+      const oldestFirst = await store.listTerminalPage("q", "completed", {
+        offset: 0,
+        limit: 1000,
+        order: "asc",
+      })
+      expect(oldestFirst.slice(-4)).toEqual(ids)
+      expect(
+        await store.listTerminalPage("q", "completed", {
+          offset: 100000,
+          limit: 5,
+          order: "desc",
+        }),
+      ).toEqual([])
+    })
+
     it("listActive reflects the active set; wipeAll clears everything", async () => {
       const wipePrefix = `${prefix}:wipe`
       const wipeStore = new RedisStateStore({
@@ -397,7 +438,7 @@ describeRedis("RedisStateStore (integration)", () => {
         expect(await store.getInstance(queue.instanceIdFor("c1"))).toBeNull()
         expect(await store.getInstance(queue.instanceIdFor("c2"))).toBeNull()
       } finally {
-        await queue.bull.obliterate({ force: true }).catch(() => undefined)
+        await queue.bullmq.obliterate({ force: true }).catch(() => undefined)
         await queue.close()
       }
     })
@@ -422,7 +463,7 @@ describeRedis("RedisStateStore (integration)", () => {
         const reaper = new DurableReaper({
           store,
           queueName: "rq-reap",
-          jobsExist: bullJobsExist(queue.bull),
+          jobsExist: bullJobKeysExist(queue.bullmq),
         })
 
         // Job still exists → state survives.
@@ -430,11 +471,11 @@ describeRedis("RedisStateStore (integration)", () => {
         expect(await store.getInstance(iid)).not.toBeNull()
 
         // Job removed → state follows.
-        await (await queue.bull.getJob("r1"))?.remove()
+        await (await queue.bullmq.getJob("r1"))?.remove()
         await reaper.reapTerminal()
         expect(await store.getInstance(iid)).toBeNull()
       } finally {
-        await queue.bull.obliterate({ force: true }).catch(() => undefined)
+        await queue.bullmq.obliterate({ force: true }).catch(() => undefined)
         await queue.close()
       }
     })
@@ -458,7 +499,7 @@ describeRedis("RedisStateStore (integration)", () => {
           resumeSeq: "2",
           updatedAt: String(Date.now() - 120_000),
         })
-        await queue.bull.add(
+        await queue.bullmq.add(
           "job",
           { __durable__: { instanceId: iid, originalJobId: "lg1", resumeSeq: 2 }, payload: {} },
           { jobId: "lg1:resume:2", delay: 3_600_000 },
@@ -467,7 +508,7 @@ describeRedis("RedisStateStore (integration)", () => {
         const reaper = new DurableReaper({
           store,
           queueName: "rq-legacy-carrier",
-          jobsExist: bullJobsExist(queue.bull),
+          jobsExist: bullJobKeysExist(queue.bullmq),
           graceMs: 60_000,
         })
         await reaper.pass(true)
@@ -475,7 +516,7 @@ describeRedis("RedisStateStore (integration)", () => {
         // NOT cancelled/reaped: the legacy carrier still owns the run.
         expect((await store.getInstance(iid))?.status).toBe("running")
       } finally {
-        await queue.bull.obliterate({ force: true }).catch(() => undefined)
+        await queue.bullmq.obliterate({ force: true }).catch(() => undefined)
         await queue.close()
       }
     })
@@ -501,14 +542,14 @@ describeRedis("RedisStateStore (integration)", () => {
         const reaper = new DurableReaper({
           store,
           queueName: "rq-orphan",
-          jobsExist: bullJobsExist(queue.bull),
+          jobsExist: bullJobKeysExist(queue.bullmq),
           graceMs: 60_000,
         })
         await reaper.pass(true)
 
         expect(await store.getInstance(iid)).toBeNull() // cancelled, then reaped
       } finally {
-        await queue.bull.obliterate({ force: true }).catch(() => undefined)
+        await queue.bullmq.obliterate({ force: true }).catch(() => undefined)
         await queue.close()
       }
     })
@@ -531,19 +572,19 @@ describeRedis("RedisStateStore (integration)", () => {
       // A 0.1.x deployment left resumeSeq=2 on the instance and a delayed
       // resume job carrying the envelope.
       await admin.hset(`${prefix}:instance:${iid}`, "resumeSeq", "2")
-      await queue.bull.add(
+      await queue.bullmq.add(
         "job",
         { __durable__: { instanceId: iid, originalJobId: "1", resumeSeq: 2 }, payload: {} },
         { jobId: "1:resume:2", delay: 3_600_000 },
       )
-      expect(await queue.bull.getJob("1:resume:2")).toBeTruthy()
+      expect(await queue.bullmq.getJob("1:resume:2")).toBeTruthy()
 
       await queue.cancel("1")
 
-      expect(await queue.bull.getJob("1:resume:2")).toBeFalsy()
+      expect(await queue.bullmq.getJob("1:resume:2")).toBeFalsy()
       expect((await store.getInstance(iid))?.status).toBe("cancelled")
     } finally {
-      await queue.bull.obliterate({ force: true }).catch(() => undefined)
+      await queue.bullmq.obliterate({ force: true }).catch(() => undefined)
       await queue.close()
     }
   })

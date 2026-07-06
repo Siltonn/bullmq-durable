@@ -18,7 +18,7 @@ import {
   RedisStateStore,
   summarizeInstances,
 } from "bullmq-durable"
-import type { DurableRun, InstanceState } from "bullmq-durable"
+import type { DurableCarrierState, DurableRun, InstanceState } from "bullmq-durable"
 import type { Queue } from "bullmq"
 import type { Redis } from "ioredis"
 import type {
@@ -103,9 +103,9 @@ export class DurableInspector {
     let queue = this.durableQueues.get(name)
     if (!queue) {
       queue = new DurableQueue(name, {
-        connection: {} as never, // never dialed: both store and bull are injected
+        connection: {} as never, // never dialed: both store and bullmq are injected
         stateStore: this.store,
-        bull: this.getQueue(name),
+        bullmq: this.getQueue(name),
       })
       this.durableQueues.set(name, queue)
     }
@@ -128,7 +128,7 @@ export class DurableInspector {
   }
 
   /** The carrier job's BullMQ state for a run (health checks). */
-  async carrierState(queueName: string, jobId: string): Promise<string> {
+  async carrierState(queueName: string, jobId: string): Promise<DurableCarrierState> {
     return this.queueFor(queueName).run(jobId).carrierState()
   }
 
@@ -144,14 +144,19 @@ export class DurableInspector {
     const page = Math.max(1, query.page)
     const status = query.status
     const isTerminal = (TERMINAL_STATUSES as readonly string[]).includes(status ?? "")
-    const kind = query.stuckOnly
-      ? "active"
-      : isTerminal
-        ? (status as (typeof TERMINAL_STATUSES)[number])
-        : !status || status === "all"
-          ? "all"
-          : "active" // a non-terminal derived status (running/sleeping/retrying/waiting)
 
+    // Terminal statuses get REAL pagination (zset offset pages), not a window.
+    if (isTerminal && !query.stuckOnly) {
+      return this.listTerminalInstances(
+        status as (typeof TERMINAL_STATUSES)[number],
+        query,
+        page,
+      )
+    }
+
+    // Non-terminal / mixed listings read the (bounded) active population,
+    // optionally plus terminal windows for "all".
+    const kind = query.stuckOnly || (status && status !== "all") ? "active" : "all"
     const window = Math.min(page * query.pageSize + query.pageSize, LIST_HARD_CAP)
     const pages = await Promise.all(
       (await this.queueNames()).map((name) => this.queueFor(name).listRuns({ kind, window })),
@@ -175,6 +180,65 @@ export class DurableInspector {
     return {
       items: summaries.slice(start, start + query.pageSize),
       total,
+      page,
+      pageSize: query.pageSize,
+      ...(truncated ? { truncated: true } : {}),
+    }
+  }
+
+  /**
+   * Terminal-status listing via `listRunsPage` — the runtime's exact offset
+   * pages over one done bucket. With a single queue and the default recency
+   * sort the offset is pushed all the way down to Redis (exact deep
+   * pagination, no cap); across queues, exact per-queue pages are merged and
+   * sliced.
+   */
+  private async listTerminalInstances(
+    status: (typeof TERMINAL_STATUSES)[number],
+    query: DurableInstanceQuery,
+    page: number,
+  ): Promise<DurableInstanceList> {
+    const names = query.queue ? [query.queue] : await this.queueNames()
+    if (names.length === 0) {
+      return { items: [], total: 0, page, pageSize: query.pageSize }
+    }
+
+    const recencySort = (query.sort ?? "updatedAt") === "updatedAt"
+    const pushdown = names.length === 1 && recencySort && !query.search && !query.jobName
+    if (pushdown) {
+      const result = await this.queueFor(names[0]!).listRunsPage({
+        kind: status,
+        offset: (page - 1) * query.pageSize,
+        limit: query.pageSize,
+        order: query.order ?? "desc",
+      })
+      return {
+        items: await this.summarize(result.runs),
+        total: result.total,
+        page,
+        pageSize: query.pageSize,
+      }
+    }
+
+    // Merge path: exact newest-first pages per queue, deep enough to cover the
+    // requested global slice, then filter/sort/slice in memory.
+    const need = Math.min(page * query.pageSize + query.pageSize, LIST_HARD_CAP)
+    const pages = await Promise.all(
+      names.map((name) =>
+        this.queueFor(name).listRunsPage({ kind: status, offset: 0, limit: need, order: "desc" }),
+      ),
+    )
+    let summaries = await this.summarize(pages.flatMap((p) => p.runs))
+    summaries = this.applyFilters(summaries, query)
+    summaries = this.applySort(summaries, query)
+
+    const bucketTotal = pages.reduce((sum, p) => sum + p.total, 0)
+    const narrowed = Boolean(query.search || query.jobName)
+    const truncated = pages.some((p) => p.total > need)
+    const start = (page - 1) * query.pageSize
+    return {
+      items: summaries.slice(start, start + query.pageSize),
+      total: narrowed ? summaries.length : bucketTotal,
       page,
       pageSize: query.pageSize,
       ...(truncated ? { truncated: true } : {}),

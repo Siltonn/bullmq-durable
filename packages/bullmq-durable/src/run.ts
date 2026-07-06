@@ -13,24 +13,15 @@
  * {@link StateStore} contract and plain BullMQ `Queue` APIs; no raw key access.
  */
 
-import type { Queue } from "bullmq"
+import type { JobState, Queue } from "bullmq"
+import { DurableActionError } from "./errors"
 import { synthesizeEvents, type DurableRunEvent } from "./inspect/derive"
+import { storageKeyOfStep } from "./execution/phase"
 import { summarizeInstances, type DurableRunSummary } from "./inspect/summarize"
 import type { StateStore } from "./store/state-store"
 import type { DurableLogEntry, InstanceState, StepState } from "./types"
 import { createInstanceId, resumeJobId } from "./utils/keys"
 import { parseJobLogs, serializeLogEntry } from "./utils/log"
-
-/** Thrown by run actions; `code` maps cleanly onto HTTP semantics. */
-export class DurableActionError extends Error {
-  constructor(
-    message: string,
-    readonly code: "not_found" | "invalid_state",
-  ) {
-    super(message)
-    this.name = "DurableActionError"
-  }
-}
 
 /** The run's (single) BullMQ job — with the 0.1.x legacy-carrier fallback. */
 export interface DurableCarrier {
@@ -38,6 +29,9 @@ export interface DurableCarrier {
   /** True when the job is a 0.1.x resume job still carrying the run. */
   legacy: boolean
 }
+
+/** The carrier job's observed BullMQ state, plus durable's missing sentinel. */
+export type DurableCarrierState = JobState | "missing" | "unknown"
 
 /**
  * What a run needs from its owning queue. Provided by {@link DurableQueue};
@@ -49,7 +43,7 @@ export interface DurableRunContext {
   readonly queueName: string
   readonly store: StateStore
   /** The queue's underlying BullMQ `Queue`. */
-  bull(): Queue
+  bullmq(): Queue
   /** Nudge the queue's reaper (read-time reap trigger). */
   kickReaper(): void
 }
@@ -121,7 +115,7 @@ export class DurableRun {
         : Promise.resolve([] as DurableLogEntry[]),
       ...jobIds.map((jobId) =>
         this.ctx
-          .bull()
+          .bullmq()
           .getJobLogs(jobId)
           .then(({ logs }) => parseJobLogs(logs))
           .catch(() => [] as DurableLogEntry[]),
@@ -162,7 +156,7 @@ export class DurableRun {
 
   /** Resolve the run's job id, preferring the primary; legacy as fallback. */
   async carrier(): Promise<DurableCarrier | null> {
-    const bull = this.ctx.bull()
+    const bull = this.ctx.bullmq()
     if (await bull.getJob(this.jobId).catch(() => undefined)) {
       return { jobId: this.jobId, legacy: false }
     }
@@ -177,22 +171,22 @@ export class DurableRun {
   }
 
   /** The carrier job's BullMQ state, or `"missing"` when it is gone. */
-  async carrierState(): Promise<string> {
+  async carrierState(): Promise<DurableCarrierState> {
     const carrier = await this.carrier()
     if (!carrier) return "missing"
     const job = await this.ctx
-      .bull()
+      .bullmq()
       .getJob(carrier.jobId)
       .catch(() => undefined)
     if (!job) return "missing"
-    return job.getState().catch(() => "unknown")
+    return job.getState().catch((): "unknown" => "unknown")
   }
 
   // -- Actions -----------------------------------------------------------------
 
   /** Re-deliver the run now: promote if delayed, retry if finished, revive if gone. */
   async resume(): Promise<void> {
-    const instance = await this.requireState()
+    const instance = await this.requireExistingInstance()
     if (instance.status === "completed" || instance.status === "cancelled") {
       throw new DurableActionError(`Cannot resume a ${instance.status} run`, "invalid_state")
     }
@@ -215,14 +209,14 @@ export class DurableRun {
    * its job is retried/revived.
    */
   async retry(): Promise<void> {
-    const instance = await this.requireState()
+    const instance = await this.requireExistingInstance()
     if (instance.status !== "failed") {
       throw new DurableActionError("Retry only applies to failed runs", "invalid_state")
     }
     const failed = (await this.steps()).filter((s) => s.status === "failed")
     await this.ctx.store.removeSteps(
       this.id,
-      failed.map((s) => storageKeyOf(s)),
+      failed.map((s) => storageKeyOfStep(s)),
     )
     await this.ctx.store.clearInstanceFields(this.id, [
       "error",
@@ -242,7 +236,7 @@ export class DurableRun {
    * compensations stay cached — then the run re-enters `compensating`.
    */
   async retryCompensation(): Promise<void> {
-    const instance = await this.requireState()
+    const instance = await this.requireExistingInstance()
     if (instance.status !== "compensation_failed") {
       throw new DurableActionError(
         "retryCompensation only applies to compensation_failed runs",
@@ -254,7 +248,7 @@ export class DurableRun {
     )
     await this.ctx.store.removeSteps(
       this.id,
-      failedInternal.map((s) => storageKeyOf(s)),
+      failedInternal.map((s) => storageKeyOfStep(s)),
     )
     // `failureError` / `failedStep` are kept so the resumed sequence matches
     // the original trigger.
@@ -270,27 +264,27 @@ export class DurableRun {
    * `DurableQueue.cancel(jobId)` (idempotent, works before the first tick).
    */
   async cancel(): Promise<void> {
-    const instance = await this.requireState()
+    const instance = await this.requireExistingInstance()
     if (instance.status === "completed" || instance.status === "cancelled") {
       throw new DurableActionError(`Cannot cancel a ${instance.status} run`, "invalid_state")
     }
     // Log BEFORE removing the job — the log line lives on that job.
     await this.appendActionLog("Cancelled", { action: "cancel" })
     await this.ctx.store.cancelInstance(this.id)
-    await removeCarrierJobs(this.ctx.bull(), instance)
+    await removeCarrierJobs(this.ctx.bullmq(), instance)
     this.ctx.kickReaper()
   }
 
   /** Delete the run's durable state (and its job, so it cannot resurrect). */
   async delete(): Promise<void> {
-    const instance = await this.requireState()
-    await removeCarrierJobs(this.ctx.bull(), instance)
+    const instance = await this.requireExistingInstance()
+    await removeCarrierJobs(this.ctx.bullmq(), instance)
     await this.ctx.store.removeInstances(this.queueName, [this.id])
   }
 
   // -- Internals ---------------------------------------------------------------
 
-  private async requireState(): Promise<InstanceState> {
+  private async requireExistingInstance(): Promise<InstanceState> {
     const instance = await this.state()
     if (!instance) {
       throw new DurableActionError(`Durable run "${this.id}" not found`, "not_found")
@@ -299,7 +293,7 @@ export class DurableRun {
   }
 
   private async reviveJob(instance: InstanceState): Promise<void> {
-    const bull = this.ctx.bull()
+    const bull = this.ctx.bullmq()
     const carrier = await this.carrier()
 
     if (carrier) {
@@ -331,7 +325,7 @@ export class DurableRun {
     try {
       const carrier = await this.carrier()
       if (!carrier) return
-      const job = await this.ctx.bull().getJob(carrier.jobId)
+      const job = await this.ctx.bullmq().getJob(carrier.jobId)
       if (!job) return
       await job.log(
         serializeLogEntry({
@@ -355,7 +349,7 @@ export class DurableRun {
  * @internal
  */
 export async function removeCarrierJobs(
-  bull: Queue,
+  bullmq: Queue,
   instance: Pick<InstanceState, "originalJobId" | "resumeSeq">,
 ): Promise<void> {
   const jobIds = [instance.originalJobId]
@@ -364,7 +358,7 @@ export async function removeCarrierJobs(
   }
   for (const jobId of jobIds) {
     try {
-      const job = await bull.getJob(jobId)
+      const job = await bullmq.getJob(jobId)
       if (job) await job.remove().catch(() => undefined)
     } catch {
       // Best effort.
@@ -372,9 +366,3 @@ export async function removeCarrierJobs(
   }
 }
 
-/** A step's storage field (phase-namespaced), reconstructed from its state. */
-function storageKeyOf(step: StepState): string {
-  if (step.phase === "compensation") return `__rollback__:${step.key}`
-  if (step.phase === "failure") return `__failure__:${step.key}`
-  return step.key
-}

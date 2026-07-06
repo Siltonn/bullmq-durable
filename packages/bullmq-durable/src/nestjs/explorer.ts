@@ -223,6 +223,7 @@ export class DurableExplorer implements OnModuleInit, OnModuleDestroy, OnApplica
       prefix: queue?.prefix ?? queue?.bullPrefix ?? root.prefix ?? root.bullPrefix,
       durablePrefix: queue?.durablePrefix ?? root.durablePrefix,
       defaultStepOptions: queue?.defaultStepOptions ?? root.defaultStepOptions,
+      reaper: queue?.reaper ?? root.reaper,
       defaultRollbackRetry: queue?.defaultRollbackRetry ?? root.defaultRollbackRetry,
       stateStore: reuseSharedStore(this.sharedStore, root, queue?.durablePrefix),
       // Deprecated 0.1.x fields pass through so the worker's option

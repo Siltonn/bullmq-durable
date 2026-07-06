@@ -8,7 +8,7 @@
 import type { ModuleMetadata, Type } from "@nestjs/common"
 import type { ConnectionOptions, JobsOptions, WorkerOptions } from "bullmq"
 import type { StateStore } from "../store/state-store"
-import type {
+import type { DurableReaperConfig,
   DurableProcessorInput,
   DurableWorkerOptions,
   RetentionOptions,
@@ -52,6 +52,8 @@ export interface DurableBullRootOptions {
   // Defaults applied to every worker unless overridden per queue.
   defaultStepOptions?: StepOptions
   defaultRollbackRetry?: RetryOptions
+  /** Tune the state reaper (state-follows-job collection). */
+  reaper?: DurableReaperConfig
 
   /** @deprecated Renamed to `prefix`. Removed in 0.3.0. */
   bullPrefix?: string
@@ -90,6 +92,8 @@ export interface DurableQueueRegistration {
   /** BullMQ `WorkerOptions` for this queue's worker (over the root default). */
   workerOptions?: DurableNestWorkerOptions
   defaultStepOptions?: StepOptions
+  /** Tune the state reaper for this queue's worker. */
+  reaper?: DurableReaperConfig
   defaultRollbackRetry?: RetryOptions
   /**
    * Processor class(es) for this queue. Listing them here auto-registers them as

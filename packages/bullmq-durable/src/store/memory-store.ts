@@ -305,6 +305,17 @@ export class MemoryStateStore implements StateStore {
       .slice(0, limit)
   }
 
+  async listTerminalPage(
+    queueName: string,
+    status: TerminalStatus,
+    query: { offset: number; limit: number; order: "asc" | "desc" },
+  ): Promise<string[]> {
+    if (query.limit <= 0) return []
+    const ordered = await this.listOldestTerminal(queueName, status, Number.MAX_SAFE_INTEGER)
+    if (query.order === "desc") ordered.reverse()
+    return ordered.slice(query.offset, query.offset + query.limit)
+  }
+
   async countTerminal(queueName: string, status: TerminalStatus): Promise<number> {
     let count = 0
     for (const record of this.records.values()) {

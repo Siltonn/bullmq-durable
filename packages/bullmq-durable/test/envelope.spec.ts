@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { isResumeEnvelope, unwrapResumeData, wrapResumeData } from "../src/envelope"
+import { isResumeEnvelope, unwrapResumeData, wrapResumeData } from "../src/legacy/envelope"
 
 describe("resume envelope", () => {
   it("wraps and unwraps a payload with durable metadata", () => {

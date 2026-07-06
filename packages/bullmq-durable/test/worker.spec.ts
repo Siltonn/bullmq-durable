@@ -7,7 +7,7 @@ import {
   MemoryStateStore,
   parseLogLine,
 } from "../src/index"
-import { resolveDurableProcessor, runOutcomeToReturn } from "../src/worker"
+import { resolveDurableHandler, resolveDurableProcessor, runOutcomeToReturn } from "../src/worker"
 import { TestEngine } from "./helpers/engine"
 
 describe("runOutcomeToReturn", () => {
@@ -65,6 +65,28 @@ describe("resolveDurableProcessor", () => {
   it("throws for an unknown job name in a handler map", () => {
     expect(() => resolveDurableProcessor({ video: fn }, "missing", "generation")).toThrow(
       /no processor registered for job "missing"/,
+    )
+  })
+
+  it("treats a top-level { run, onFailure } as the default handler for every job name", () => {
+    const onFailure = async () => undefined
+    const handler = resolveDurableHandler({ run: fn, onFailure }, "any-job-name", "q")
+    expect(handler.run).toBe(fn)
+    expect(handler.onFailure).toBe(onFailure)
+    // Job name is irrelevant — same handler for another name.
+    expect(resolveDurableHandler({ run: fn }, "other", "q").run).toBe(fn)
+  })
+
+  it("`run` stays usable as a job name via the object entry form", () => {
+    // { run: { run: fn } } — the outer `run` property is an OBJECT, so this is
+    // a handler map with a job literally named "run", not a default handler.
+    const onFailure = async () => undefined
+    const handler = resolveDurableHandler({ run: { run: fn, onFailure } }, "run", "q")
+    expect(handler.run).toBe(fn)
+    expect(handler.onFailure).toBe(onFailure)
+    // Other job names on that map still miss.
+    expect(() => resolveDurableHandler({ run: { run: fn } }, "video", "q")).toThrow(
+      /no processor registered/,
     )
   })
 })

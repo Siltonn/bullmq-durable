@@ -282,7 +282,7 @@ async function seedGeneration(redis: Redis): Promise<void> {
 
   // A legacy (0.1.x) orphan resume job: an in-flight envelope tick whose
   // instance does not exist — exercises the rolling-upgrade health path.
-  await queue.bull.add(
+  await queue.bullmq.add(
     "video",
     {
       __durable__: { instanceId: "generation:vid-ghost-1", originalJobId: "vid-ghost-1", resumeSeq: 1 },
@@ -306,7 +306,7 @@ async function seedGeneration(redis: Redis): Promise<void> {
     current: { key: "poll-provider", attempts: 3, nextRunInMs: 9 * 60 * 1000 },
     logs: ["Starting generation for vid-legacy-1", "provider still rendering (legacy tick)"],
   })
-  await queue.bull.add(
+  await queue.bullmq.add(
     "video",
     {
       __durable__: {
@@ -797,7 +797,7 @@ async function seedMediaPipeline(redis: Redis): Promise<void> {
   })
   // 0.2.x: the run rides ONE job — a retrying instance's carrier is its own
   // job parked in the delayed set.
-  await queue.bull.add("encode", { id: "movie-770", mode: "complete" }, {
+  await queue.bullmq.add("encode", { id: "movie-770", mode: "complete" }, {
     jobId: "movie-770",
     delay: 90_000,
   })
@@ -815,7 +815,7 @@ async function seedMediaPipeline(redis: Redis): Promise<void> {
     current: { key: "poll-encoder", attempts: 9, nextRunInMs: -42 * 60 * 1000 },
     logs: ["Encode request for movie-771", "Encoder busy — retrying"],
   })
-  await queue.bull.add(
+  await queue.bullmq.add(
     "encode",
     { id: "movie-771", mode: "complete" },
     { jobId: "movie-771", delay: 12 * 60 * 60 * 1000 },

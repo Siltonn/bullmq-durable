@@ -20,15 +20,15 @@ import {
   type JobLogSink,
   type PendingResume,
   type RunMode,
-  SettleIncompleteError,
 } from "./context"
 import {
   DurableCancelledError,
   DurableNonRetryableError,
   DurableYieldError,
   isStepFailure,
-} from "./errors"
-import type { StateStore } from "./store/state-store"
+  SettleIncompleteError,
+} from "../errors"
+import type { StateStore } from "../store/state-store"
 import type {
   CompensationReport,
   DurableContext,
@@ -38,8 +38,8 @@ import type {
   DurableProcessor,
   RetryOptions,
   StepOptions,
-} from "./types"
-import { deserializeError, serializeError } from "./utils/serialize"
+} from "../types"
+import { deserializeError, serializeError } from "../utils/serialize"
 
 /** The result of a single execution tick, translated to BullMQ by the worker. */
 export type RunOutcome =

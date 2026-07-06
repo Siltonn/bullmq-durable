@@ -12,8 +12,10 @@ export {
   type DurableRunListKind,
   type DurableRunListQuery,
   type DurableRunPage,
+  type DurableRunPageQuery,
+  type DurableRunPageResult,
 } from "./queue"
-export { DurableActionError, DurableRun, type DurableCarrier } from "./run"
+export { DurableRun, type DurableCarrier, type DurableCarrierState } from "./run"
 export { DurableWorker, runOutcomeToReturn } from "./worker"
 export {
   DurableContextImpl,
@@ -21,14 +23,14 @@ export {
   type JobLogSink,
   type PendingResume,
   type RunMode,
-} from "./context"
+} from "./execution/context"
 export {
   DurableRuntime,
   type DurableRuntimeJob,
   type DurableRuntimeParams,
   type RunOutcome,
-} from "./runtime"
-export { DurableReaper, bullJobsExist, type JobsExist } from "./reaper"
+} from "./execution/runtime"
+export { bullJobKeysExist, DurableReaper, type JobsExist } from "./reaper"
 export {
   summarizeInstances,
   type DurableRunSummary,
@@ -53,7 +55,7 @@ export {
   unwrapResumeData,
   type DurableMeta,
   type ResumeEnvelope,
-} from "./envelope"
+} from "./legacy/envelope"
 
 export * from "./errors"
 export * from "./types"

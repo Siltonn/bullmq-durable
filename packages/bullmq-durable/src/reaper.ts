@@ -14,7 +14,7 @@
  */
 
 import type { StateStore } from "./store/state-store"
-import { isTerminalStatus, resumeJobId, TERMINAL_STATUSES } from "./utils/keys"
+import { resumeJobId, TERMINAL_STATUSES } from "./utils/keys"
 
 /** Batched bull-side existence check for job ids (same-queue). */
 export type JobsExist = (jobIds: string[]) => Promise<boolean[]>
@@ -23,14 +23,14 @@ export interface DurableReaperOptions {
   store: StateStore
   queueName: string
   jobsExist: JobsExist
-  /** Oldest entries checked per bucket per pass. Default 8. */
+  /** Oldest entries checked per bucket per pass. Default 32. */
   batch?: number
   /** Min interval between fire-and-forget passes. Default 5s. */
   throttleMs?: number
   /**
    * An active instance whose job is missing is only treated as an orphan once
-   * it has been quiet this long — absorbs the 0.1.x rolling-upgrade window
-   * where "complete job A, enqueue resume B" is momentarily jobless. Default 60s.
+   * it has been quiet this long — absorbs short races (a just-created instance
+   * beating its job write, a mid-hand-off legacy tick). Default 10s.
    */
   graceMs?: number
 }
@@ -43,9 +43,9 @@ export class DurableReaper {
   private running = false
 
   constructor(private readonly opts: DurableReaperOptions) {
-    this.batch = opts.batch ?? 8
+    this.batch = opts.batch ?? 32
     this.throttleMs = opts.throttleMs ?? 5_000
-    this.graceMs = opts.graceMs ?? 60_000
+    this.graceMs = opts.graceMs ?? 10_000
   }
 
   /** instanceId = `${queueName}:${jobId}` — strip the fixed prefix back off. */
@@ -156,66 +156,62 @@ export class DurableReaper {
     return alive === true
   }
 
-  /**
-   * Precise, single-instance follow of a `removed` queue event: terminal state
-   * is reaped immediately; a non-terminal instance was hand-deleted mid-flight
-   * — mark it cancelled, then reap.
-   */
-  async onJobRemoved(instanceId: string): Promise<void> {
-    const instance = await this.opts.store.getInstance(instanceId)
-    if (!instance) return
-    if (!isTerminalStatus(instance.status)) {
-      // The run may still ride a legacy 0.1.x resume job (the removed id was
-      // the original). Leave it alone — the shim delivery will migrate it.
-      if (await this.legacyCarrierAlive(instance)) return
-      await this.opts.store.cancelInstance(instanceId)
-    }
-    await this.opts.store.removeInstances(this.opts.queueName, [instanceId])
-  }
 }
 
-/**
- * Wire a host-provided `QueueEvents` to a reaper: `removed` handles the exact
- * instance (reap terminal / cancel a hand-deleted run); `cleaned` triggers a
- * batch reap+reconcile. Shared by DurableQueue.attachQueueEvents and
- * DurableWorker.attachQueueEvents. Returns the detach function.
- */
-export function wireQueueEvents(
-  queueEvents: {
-    on(event: "removed", listener: (args: { jobId: string }) => void): unknown
-    on(event: "cleaned", listener: () => void): unknown
-    off(event: "removed", listener: (args: { jobId: string }) => void): unknown
-    off(event: "cleaned", listener: () => void): unknown
-  },
-  reaper: DurableReaper,
-  toInstanceId: (jobId: string) => string,
-): () => void {
-  const onRemoved = ({ jobId }: { jobId: string }) => {
-    void reaper.onJobRemoved(toInstanceId(jobId)).catch(() => undefined)
-  }
-  const onCleaned = () => {
-    void reaper.pass(true).catch(() => undefined)
-  }
-  queueEvents.on("removed", onRemoved)
-  queueEvents.on("cleaned", onCleaned)
-  return () => {
-    queueEvents.off("removed", onRemoved)
-    queueEvents.off("cleaned", onCleaned)
+type ExistsCapable = { exists(key: string): Promise<number | string> }
+type PipelineCapable = {
+  pipeline(commands: Array<[string, ...string[]]>): {
+    exec(): Promise<Array<[error: Error | null, result: unknown]> | null>
   }
 }
 
 /**
  * Build a {@link JobsExist} from anything QueueBase-shaped (a BullMQ `Queue` or
- * `Worker`): batched `EXISTS` on the job hash keys over the instance's own
+ * `Worker`): `EXISTS` on the job **hash keys** over the instance's own
  * connection — no extra client, no per-id `getJob` hydration.
+ *
+ * One `EXISTS` per key (a single variadic call only returns a count, not which
+ * keys exist). Pipelined into one round trip when the client supports it
+ * (ioredis does); falls back to concurrent per-key calls otherwise. On any
+ * per-key error the key is reported as EXISTING — uncertainty must never make
+ * the reaper delete live state.
  */
-export function bullJobsExist(base: { toKey(id: string): string; client: Promise<unknown> }): JobsExist {
+export function bullJobKeysExist(base: {
+  toKey(id: string): string
+  client: Promise<unknown>
+}): JobsExist {
   return async (jobIds: string[]): Promise<boolean[]> => {
     if (jobIds.length === 0) return []
-    // BullMQ's `client` is typed as a narrowed IRedisClient; EXISTS is present
-    // on every real client (ioredis / cluster) even though the type omits it.
-    const client = (await base.client) as { exists(...keys: string[]): Promise<number> }
-    // One EXISTS per id (not one EXISTS with N keys) so each answer is exact.
-    return Promise.all(jobIds.map(async (id) => (await client.exists(base.toKey(id))) === 1))
+    // BullMQ types `client` as a narrowed IRedisClient without exists/pipeline;
+    // guard at runtime instead of blindly asserting the shape.
+    const client = (await base.client) as Partial<ExistsCapable & PipelineCapable>
+    const keys = jobIds.map((id) => base.toKey(id))
+
+    if (typeof client.pipeline === "function") {
+      try {
+        const results = await client.pipeline(keys.map((key) => ["exists", key])).exec()
+        if (results && results.length === keys.length) {
+          return results.map(([error, value]) => (error ? true : Number(value) === 1))
+        }
+      } catch {
+        // Unexpected pipeline shape/failure — fall through to per-key EXISTS.
+      }
+    }
+    if (typeof client.exists === "function") {
+      const exists = client.exists.bind(client)
+      return Promise.all(
+        keys.map(async (key) => {
+          try {
+            return Number(await exists(key)) === 1
+          } catch {
+            return true // uncertain → treat as existing (never reap on doubt)
+          }
+        }),
+      )
+    }
+    throw new TypeError(
+      "bullJobKeysExist: the Redis client exposes neither pipeline() nor exists()",
+    )
   }
 }
+

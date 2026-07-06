@@ -19,9 +19,9 @@
  * connection until it is actually used.
  */
 
-import { type JobsOptions, Queue, type QueueEvents, type QueueOptions } from "bullmq"
+import { type JobsOptions, Queue, type QueueOptions } from "bullmq"
 import { summarizeInstances, type DurableRunSummary, type SummarizeOptions } from "./inspect/summarize"
-import { bullJobsExist, DurableReaper, wireQueueEvents } from "./reaper"
+import { bullJobKeysExist, DurableReaper } from "./reaper"
 import { DurableRun, removeCarrierJobs, type DurableRunContext } from "./run"
 import { RedisStateStore } from "./store/redis-store"
 import type { StateStore } from "./store/state-store"
@@ -72,6 +72,24 @@ export interface DurableRunCounts {
   cancelled: number
 }
 
+/** A true offset page over ONE terminal bucket (zset-backed, exact). */
+export interface DurableRunPageQuery {
+  kind: TerminalStatus
+  offset: number
+  limit: number
+  /** By terminal-transition time. Default `"desc"` (newest first). */
+  order?: "asc" | "desc"
+}
+
+export interface DurableRunPageResult {
+  /** Run handles with their {@link DurableRun.snapshot} populated. */
+  runs: DurableRun[]
+  /** Exact bucket cardinality (for page counts). */
+  total: number
+  /** True: an exact offset slice of the bucket, not a recency window. */
+  exact: boolean
+}
+
 export class DurableQueue<TData = any, TResult = any, TName extends string = string> {
   private queue?: Queue
   private ownsBull = false
@@ -79,7 +97,6 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
   private ownsStore = false
   private reaperInstance?: DurableReaper
   private runCtx?: DurableRunContext
-  private readonly queueEventCleanups: Array<() => void> = []
 
   constructor(
     readonly name: string,
@@ -92,10 +109,10 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
   }
 
   /** Lazily resolve the underlying BullMQ queue (injected one if provided). */
-  get bull(): Queue {
+  get bullmq(): Queue {
     if (!this.queue) {
-      if (this.options.bull) {
-        this.queue = this.options.bull
+      if (this.options.bullmq) {
+        this.queue = this.options.bullmq
       } else {
         this.queue = new Queue(this.name, buildQueueOptions(this.options))
         this.ownsBull = true
@@ -125,7 +142,10 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
       this.reaperInstance = new DurableReaper({
         store: this.stateStore,
         queueName: this.name,
-        jobsExist: bullJobsExist(this.bull),
+        jobsExist: bullJobKeysExist(this.bullmq),
+        batch: this.options.reaper?.terminalBatchSize,
+        throttleMs: this.options.reaper?.throttleMs,
+        graceMs: this.options.reaper?.orphanGraceMs,
       })
     }
     return this.reaperInstance
@@ -140,7 +160,7 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
         get store() {
           return self.stateStore
         },
-        bull: () => self.bull,
+        bullmq: () => self.bullmq,
         kickReaper: () => self.reaper.kick(),
       }
     }
@@ -157,7 +177,7 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
     data: TData,
     opts?: JobsOptions,
   ): Promise<DurableJob<TData, TResult, TName>> {
-    const job = await this.bull.add(name, data, opts)
+    const job = await this.bullmq.add(name, data, opts)
     return annotateDurable(job, createInstanceId(this.name, job.id ?? "")) as DurableJob<
       TData,
       TResult,
@@ -233,6 +253,37 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
     return { runs, indexTotal, truncated, windowed: buckets.length > 0 }
   }
 
+  /**
+   * A true page of one terminal bucket, ordered by terminal-transition time —
+   * `ZRANGE`/`ZREVRANGE` with a real offset, so deep pagination stays exact
+   * (unlike `listRuns`, which is a recency window). Phantom ids self-heal out
+   * of the index, so a page may transiently return fewer than `limit` runs.
+   */
+  async listRunsPage(query: DurableRunPageQuery): Promise<DurableRunPageResult> {
+    const limit = Math.max(0, query.limit)
+    const [ids, total] = await Promise.all([
+      this.stateStore.listTerminalPage(this.name, query.kind, {
+        offset: Math.max(0, query.offset),
+        limit,
+        order: query.order ?? "desc",
+      }),
+      this.stateStore.countTerminal(this.name, query.kind),
+    ])
+
+    const loaded = await this.stateStore.getInstances(ids)
+    const runs: DurableRun[] = []
+    const gone: string[] = []
+    loaded.forEach((instance, index) => {
+      if (instance) runs.push(this.run(instance.originalJobId, instance))
+      else gone.push(ids[index]!)
+    })
+    if (gone.length > 0) {
+      void this.stateStore.removeInstances(this.name, gone).catch(() => undefined)
+    }
+
+    return { runs, total, exact: true }
+  }
+
   /** The full (bounded) non-terminal population, snapshots loaded. */
   async activeRuns(): Promise<DurableRun[]> {
     return (await this.listRuns({ kind: "active", window: 0 })).runs
@@ -293,21 +344,25 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
   }
 
   /**
-   * Cancel a durable run — the lenient, application-side path: idempotent,
-   * works even before the first tick has created state (the cancelled marker
-   * makes that tick stop immediately). Dashboards wanting strict state
-   * validation use `run.cancel()` instead.
+   * Cancel a durable run. When durable state already exists, marks it
+   * cancelled so future durable checkpoints stop. When state does not exist
+   * yet, best-effort removes the BullMQ job before it starts — no cancelled
+   * state is fabricated for a run that never began.
    *
-   * Removal is by exact id, never a scan. Correctness does not rely on it: a
-   * tick that still fires observes the cancelled status and stops.
+   * This follows BullMQ's boundary: an already active/locked job cannot be
+   * forcibly removed from the outside, so cancellation does not guarantee
+   * that a processor already claimed by a worker is stopped before user code
+   * runs — an existing run stops at its next durable checkpoint instead.
+   * Idempotent and never a scan. Use `run.cancel()` for dashboard/ops paths
+   * that require strict existing-run validation.
    */
   async cancel(jobId: string | number): Promise<void> {
-    const instanceId = this.instanceIdFor(jobId)
-    const instance = await this.stateStore.getInstance(instanceId)
-    await this.stateStore.cancelInstance(instanceId)
-    // Best effort — the instance is already marked cancelled either way. The
-    // helper also covers a 0.1.x legacy resume-job carrier (removed in 0.3.0).
-    await removeCarrierJobs(this.bull, {
+    const instance = await this.stateStore.getInstance(this.instanceIdFor(jobId))
+    if (instance) await this.stateStore.cancelInstance(instance.id)
+    // Best effort — the helper also covers a 0.1.x legacy resume-job carrier
+    // (removed in 0.3.0). Failure to remove is fine: a cancelled instance
+    // stops at its next checkpoint; a stateless run just runs (see above).
+    await removeCarrierJobs(this.bullmq, {
       originalJobId: instance?.originalJobId ?? String(jobId),
       ...(instance?.resumeSeq !== undefined ? { resumeSeq: instance.resumeSeq } : {}),
     })
@@ -324,12 +379,17 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
     limit: number,
     type?: Parameters<Queue["clean"]>[2],
   ): Promise<string[]> {
-    const removed = await this.bull.clean(graceMs, limit, type)
+    const removed = await this.bullmq.clean(graceMs, limit, type)
     if (removed.length > 0) {
       await this.stateStore.removeInstances(
         this.name,
         removed.map((id) => this.instanceIdFor(id)),
       )
+      // Some removed ids may not map 1:1 onto instance ids (e.g. a 0.1.x
+      // legacy resume job carrying a run) — rather than parse legacy id
+      // shapes here, run a reconcile+reap pass to collect whatever the exact
+      // removal above missed.
+      await this.reaper.pass(true)
     }
     return removed
   }
@@ -340,7 +400,7 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
    * are cancelled and reaped.
    */
   async drain(delayed?: boolean): Promise<void> {
-    await this.bull.drain(delayed)
+    await this.bullmq.drain(delayed)
     await this.reaper.pass(true)
   }
 
@@ -349,25 +409,12 @@ export class DurableQueue<TData = any, TResult = any, TName extends string = str
    * queue — index-driven (active set + done buckets), no key scan.
    */
   async obliterate(opts?: Parameters<Queue["obliterate"]>[0]): Promise<void> {
-    await this.bull.obliterate(opts)
+    await this.bullmq.obliterate(opts)
     await this.stateStore.wipeQueue(this.name)
-  }
-
-  /**
-   * Reuse a host-provided `QueueEvents` as the real-time layer of
-   * state-follows-job (see the worker's counterpart). Optional accelerator —
-   * correctness never depends on it.
-   */
-  attachQueueEvents(queueEvents: QueueEvents): this {
-    this.queueEventCleanups.push(
-      wireQueueEvents(queueEvents, this.reaper, (jobId) => this.instanceIdFor(jobId)),
-    )
-    return this
   }
 
   /** Close whatever this queue opened itself (injected resources stay open). */
   async close(): Promise<void> {
-    for (const cleanup of this.queueEventCleanups.splice(0)) cleanup()
     if (this.queue && this.ownsBull) await this.queue.close()
     if (this.store && this.ownsStore) await this.store.close()
   }
@@ -382,7 +429,8 @@ export function buildQueueOptions(options: DurableQueueOptions): QueueOptions {
   const {
     stateStore: _stateStore,
     durablePrefix: _durablePrefix,
-    bull: _bull,
+    bullmq: _bullmq,
+    reaper: _reaper,
     bullPrefix,
     resumeAttempts,
     ...queueOptions

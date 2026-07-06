@@ -385,10 +385,23 @@ export type DurableProcessorHandlers = Record<
 >
 
 /**
- * The processor argument accepted by `DurableWorker`: either a single function
- * that handles every job name, or a per-name handler map.
+ * The processor argument accepted by `DurableWorker`, in three forms:
+ *
+ *  1. a single function — handles every job name;
+ *  2. a top-level `{ run, onFailure }` — the worker's default handler, for the
+ *     common "one queue = one workflow" shape where the job name is just a
+ *     label and `onFailure` belongs with the processor, not the options;
+ *  3. a per-name handler map — multi-job workers.
+ *
+ * Disambiguation makes `run` a reserved word in the map form: an object whose
+ * `run` property is a FUNCTION is read as form 2. A worker that really has a
+ * job named `"run"` still works — use the object entry:
+ * `{ run: { run: handleRunJob } }`.
  */
-export type DurableProcessorInput = DurableProcessor<any, any, string> | DurableProcessorHandlers
+export type DurableProcessorInput =
+  | DurableProcessor<any, any, string>
+  | DurableJobHandler<any, any, string>
+  | DurableProcessorHandlers
 
 // ---------------------------------------------------------------------------
 // Options
@@ -429,11 +442,30 @@ export interface DurableQueueOptions extends QueueOptions {
    * e.g. a dashboard that already holds one per queue. Ownership stays with
    * the caller: `DurableQueue.close()` will not close an injected queue.
    */
-  bull?: BullQueue
+  bullmq?: BullQueue
+  /** Tune the state reaper (state-follows-job collection). */
+  reaper?: DurableReaperConfig
   /** @deprecated Renamed to `prefix` (BullMQ's own option). Removed in 0.3.0. */
   bullPrefix?: string
   /** @deprecated 0.2.0 has no resume jobs; accepted and ignored. Removed in 0.3.0. */
   resumeAttempts?: number
+}
+
+/**
+ * Tuning for the state reaper — the observer that deletes durable state once
+ * its BullMQ job is gone. Defaults suit most deployments; raise
+ * `terminalBatchSize` when heavy `removeOn*` churn leaves large trails.
+ */
+export interface DurableReaperConfig {
+  /** Oldest entries checked per done-bucket per pass. Default 32. */
+  terminalBatchSize?: number
+  /** Min interval between fire-and-forget reap passes. Default 5s (5_000). */
+  throttleMs?: number
+  /**
+   * How long a non-terminal instance whose job is missing must stay quiet
+   * before it is treated as an orphan and cancelled. Default 10s (10_000).
+   */
+  orphanGraceMs?: number
 }
 
 /**
@@ -446,6 +478,8 @@ export interface DurableWorkerOptions extends WorkerOptions {
   stateStore?: StateStore
   /** Redis key prefix for durable state. Defaults to `"bullmq-durable"`. */
   durablePrefix?: string
+  /** Tune the state reaper (state-follows-job collection). */
+  reaper?: DurableReaperConfig
   /** Default step options merged into every `ctx.step` call. */
   defaultStepOptions?: StepOptions
   /**

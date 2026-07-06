@@ -26,6 +26,12 @@ upgrade.
 - **Per-queue durable index**: reads follow the runtime's new
   `{prefix}:idx:{queue}:*` buckets; the seed's direct-written fixtures now
   register in the index (previously invisible to the index-driven list).
+- **Exact pagination for terminal statuses**: completed / failed /
+  compensation_failed / cancelled listings use the runtime's
+  `listRunsPage` zset offset pages instead of a recency window. With a single
+  queue and the default recency sort the offset is pushed down to Redis, so
+  deep pages stay exact with no hard cap; cross-queue listings merge exact
+  per-queue pages.
 - **Queue-name validation**: every client-supplied queue name is validated
   against the discovered/allow-listed set (404 for unknown names) — an
   arbitrary name can no longer create BullMQ meta keys or grow the queue

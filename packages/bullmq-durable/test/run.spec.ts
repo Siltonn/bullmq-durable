@@ -56,7 +56,7 @@ function queueWith(name: string, store: MemoryStateStore, bull: ReturnType<typeo
   return new DurableQueue(name, {
     connection: {} as never,
     stateStore: store,
-    bull: bull as never,
+    bullmq: bull as never,
   })
 }
 
@@ -131,11 +131,93 @@ describe("DurableQueue run collection", () => {
     expect(summaries[0]!.view.nextRunAt).toBeTypeOf("number")
   })
 
+  it("pages one terminal bucket exactly, both orders", async () => {
+    const store = new MemoryStateStore()
+    for (let i = 1; i <= 5; i++) {
+      await store.initInstance({
+        instanceId: `q:p${i}`,
+        queueName: "q",
+        jobName: "job",
+        jobId: `p${i}`,
+        input: {},
+      })
+      await store.completeInstance(`q:p${i}`, i)
+      await new Promise((resolve) => setTimeout(resolve, 2)) // distinct terminalAt
+    }
+    const queue = queueWith("q", store, fakeQueue())
+
+    const page1 = await queue.listRunsPage({ kind: "completed", offset: 0, limit: 2 })
+    expect(page1.total).toBe(5)
+    expect(page1.exact).toBe(true)
+    expect(page1.runs.map((r) => r.jobId)).toEqual(["p5", "p4"]) // newest first
+
+    const page2 = await queue.listRunsPage({ kind: "completed", offset: 2, limit: 2 })
+    expect(page2.runs.map((r) => r.jobId)).toEqual(["p3", "p2"])
+
+    const asc = await queue.listRunsPage({ kind: "completed", offset: 0, limit: 2, order: "asc" })
+    expect(asc.runs.map((r) => r.jobId)).toEqual(["p1", "p2"]) // oldest first
+
+    const beyond = await queue.listRunsPage({ kind: "completed", offset: 10, limit: 2 })
+    expect(beyond.runs).toEqual([])
+    expect(beyond.total).toBe(5)
+  })
+
+  describe("cancel (lenient, application-side)", () => {
+    it("with existing state: marks cancelled and removes the job", async () => {
+      const store = new MemoryStateStore()
+      await store.initInstance({
+        instanceId: "q:c9",
+        queueName: "q",
+        jobName: "job",
+        jobId: "c9",
+        input: {},
+      })
+      const bull = fakeQueue()
+      bull.seed("c9", "delayed")
+      const queue = queueWith("q", store, bull)
+
+      await queue.cancel("c9")
+      expect((await store.getInstance("q:c9"))?.status).toBe("cancelled")
+      expect(bull.jobs.has("c9")).toBe(false)
+    })
+
+    it("without state: removes the job and fabricates NO cancelled state", async () => {
+      const store = new MemoryStateStore()
+      const bull = fakeQueue()
+      bull.seed("j1", "waiting")
+      const queue = queueWith("q", store, bull)
+
+      await queue.cancel("j1")
+      expect(bull.jobs.has("j1")).toBe(false) // remove attempted and succeeded
+      expect(await store.getInstance("q:j1")).toBeNull() // no tombstone invented
+    })
+
+    it("still resolves when the BullMQ removal fails (best effort)", async () => {
+      const store = new MemoryStateStore()
+      const bull = fakeQueue()
+      bull.seed("j2", "active")
+      const record = await bull.getJob("j2")
+      void record
+      // Simulate an active/locked job: remove() throws.
+      const original = bull.getJob.bind(bull)
+      bull.getJob = async (id: string) => {
+        const job = await original(id)
+        if (!job) return undefined
+        return { ...job, remove: async () => Promise.reject(new Error("locked")) }
+      }
+      const queue = queueWith("q", store, bull)
+
+      await expect(queue.cancel("j2")).resolves.toBeUndefined()
+      expect(bull.jobs.has("j2")).toBe(true) // BullMQ boundary: active job stays
+      expect(await store.getInstance("q:j2")).toBeNull()
+    })
+  })
+
   it("close() leaves injected bull queue and store alone", async () => {
     const store = new MemoryStateStore()
     const bull = fakeQueue() // has no close(): closing it would throw
     const queue = queueWith("q", store, bull)
-    void queue.bull // force lazy resolution of the injected instance
+    void queue.bullmq // force lazy resolution of the injected instance
     await queue.close()
     // The store remains usable after close — it was injected, not owned.
     expect(await store.queues()).toEqual([])
@@ -218,3 +300,4 @@ describe("DurableRun", () => {
     await expect(queue.run("ghost").retry()).rejects.toMatchObject({ code: "not_found" })
   })
 })
+

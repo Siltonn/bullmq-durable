@@ -11,15 +11,20 @@
  *  - a reaper deletes durable state once its job is gone (state follows job).
  */
 
-import { DelayedError, type Job, type QueueEvents, Worker, type WorkerOptions } from "bullmq"
-import { unwrapResumeData } from "./envelope"
-import { DurableCancelledJobError, DurableTerminalJobError } from "./errors"
-import { bullJobsExist, DurableReaper, wireQueueEvents } from "./reaper"
-import { DurableRuntime, type DurableRuntimeJob, type RunOutcome } from "./runtime"
+import { DelayedError, type Job, Worker, type WorkerOptions } from "bullmq"
+import { unwrapResumeData } from "./legacy/envelope"
+import {
+  DurableCancelledJobError,
+  DurableTerminalJobError,
+  isDurableBoundaryError,
+} from "./errors"
+import { bullJobKeysExist, DurableReaper } from "./reaper"
+import { DurableRuntime, type DurableRuntimeJob, type RunOutcome } from "./execution/runtime"
 import { RedisStateStore } from "./store/redis-store"
 import type { StateStore } from "./store/state-store"
 import type {
   DurableFailureHandler,
+  DurableJobHandler,
   DurableProcessor,
   DurableProcessorHandlers,
   DurableProcessorInput,
@@ -39,7 +44,6 @@ export class DurableWorker {
   private readonly store: StateStore
   private readonly ownsStore: boolean
   private readonly reaper: DurableReaper
-  private readonly queueEventCleanups: Array<() => void> = []
 
   constructor(
     readonly queueName: string,
@@ -63,7 +67,10 @@ export class DurableWorker {
     this.reaper = new DurableReaper({
       store: this.store,
       queueName,
-      jobsExist: bullJobsExist(this.bullWorker),
+      jobsExist: bullJobKeysExist(this.bullWorker),
+      batch: options.reaper?.terminalBatchSize,
+      throttleMs: options.reaper?.throttleMs,
+      graceMs: options.reaper?.orphanGraceMs,
     })
 
     // Settle runs whose in-processor path never finished: stall-death (the
@@ -132,7 +139,9 @@ export class DurableWorker {
 
       // Our own boundary errors are the COMMON failed-event cause and always
       // follow an in-processor settlement — skip the Redis read entirely.
-      if (error instanceof DurableTerminalJobError || error instanceof DurableCancelledJobError) {
+      // (Marker/name-robust check: a duplicated bullmq-durable copy must not
+      // downgrade this into a spurious settle tick.)
+      if (isDurableBoundaryError(error)) {
         this.reaper.kick()
         return
       }
@@ -151,9 +160,7 @@ export class DurableWorker {
       const attemptsTotal = job.opts?.attempts ?? 1
       const unrecoverable =
         error instanceof Error &&
-        (error.name === "UnrecoverableError" ||
-          error instanceof DurableTerminalJobError ||
-          error instanceof DurableCancelledJobError)
+        (error.name === "UnrecoverableError" || isDurableBoundaryError(error))
       if (!unrecoverable && (job.attemptsMade ?? 0) < attemptsTotal) {
         return // BullMQ re-delivers; the live path will handle it.
       }
@@ -185,21 +192,6 @@ export class DurableWorker {
     }
   }
 
-  /**
-   * Reuse a host-provided `QueueEvents` (no extra connection) as the real-time
-   * layer of state-follows-job: `removed` reaps (or cancels) the affected
-   * instance immediately; `cleaned` triggers a batch reap+reconcile. Purely an
-   * accelerator — correctness comes from write/read-time reaping.
-   */
-  attachQueueEvents(queueEvents: QueueEvents): this {
-    this.queueEventCleanups.push(
-      wireQueueEvents(queueEvents, this.reaper, (jobId) =>
-        createInstanceId(this.queueName, jobId),
-      ),
-    )
-    return this
-  }
-
   // -- Pass-through surface ------------------------------------------------
 
   /** The underlying BullMQ worker (for event listeners, metrics, etc.). */
@@ -225,7 +217,6 @@ export class DurableWorker {
 
   /** Close the worker and any store we created. */
   async close(): Promise<void> {
-    for (const cleanup of this.queueEventCleanups.splice(0)) cleanup()
     await this.bullWorker.close()
     if (this.ownsStore) await this.store.close()
   }
@@ -340,8 +331,11 @@ export interface ResolvedDurableHandler {
 
 /**
  * Resolve the `{ run, onFailure }` for a job name — accepting a single function
- * (handles every job), a per-name function, or a per-name `{ run, onFailure }`
- * object. Exported for unit testing.
+ * (handles every job), a TOP-LEVEL `{ run, onFailure }` (the worker's default
+ * handler, job name ignored), a per-name function, or a per-name
+ * `{ run, onFailure }` object. `run` is a reserved word in the map form: a
+ * job actually named "run" uses the object entry (`{ run: { run: fn } }`).
+ * Exported for unit testing.
  */
 export function resolveDurableHandler(
   input: DurableProcessorInput,
@@ -350,6 +344,16 @@ export function resolveDurableHandler(
 ): ResolvedDurableHandler {
   if (typeof input === "function") {
     return { run: input as DurableProcessor }
+  }
+  // Top-level default handler: `{ run, onFailure }` with `run` a function.
+  // (A handler MAP whose "run" job uses the object form falls through — its
+  // `run` property is an object, not a function.)
+  if (typeof (input as DurableJobHandler).run === "function") {
+    const handler = input as DurableJobHandler
+    return {
+      run: handler.run as DurableProcessor,
+      onFailure: handler.onFailure as DurableFailureHandler | undefined,
+    }
   }
   const entry = (input as DurableProcessorHandlers)[jobName]
   if (!entry) {

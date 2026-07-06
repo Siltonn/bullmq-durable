@@ -157,6 +157,16 @@ export interface StateStore {
   ): Promise<string[]>
 
   /** The newest `limit` ids in a queue's terminal bucket (newest first). */
+  /**
+   * A true offset page of one terminal bucket, ordered by terminal-transition
+   * time (`order: "desc"` = newest first). Exact — backs `listRunsPage`.
+   */
+  listTerminalPage(
+    queueName: string,
+    status: TerminalStatus,
+    query: { offset: number; limit: number; order: "asc" | "desc" },
+  ): Promise<string[]>
+
   listNewestTerminal(
     queueName: string,
     status: TerminalStatus,

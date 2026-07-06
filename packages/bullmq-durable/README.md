@@ -48,7 +48,8 @@ docs: { quick_start: "#quick-start", core_concepts: "#core-concepts", retries: "
 
 > **Tooling note** — dashboards and ops scripts use the same object model as
 > application code: **`DurableQueue`** owns the collection (`run` / `getRun` /
-> `listRuns` / `countRuns` / `activeRuns` / `summarizeRuns` / `reconcile`) and
+> `listRuns` / `listRunsPage` / `countRuns` / `activeRuns` / `summarizeRuns` /
+> `reconcile`) and
 > **`DurableRun`** is the run entity (`state` / `steps` / `logs` / `events` /
 > `summary` / `carrier`, `resume` / `retry` / `retryCompensation` / `cancel` /
 > `delete`, legacy-carrier resolution built in) — never read the Redis layout;
@@ -447,19 +448,19 @@ record.
 | `{ age }` / `{ count }` / a number  | job pruned by BullMQ later → state reclaimed alongside      |
 | `false` / unset (BullMQ default)    | job kept forever → state kept forever                       |
 
-Reclamation is observational, not predictive: on terminal writes and durable-state reads, the
-library checks a small batch of the oldest finished runs for jobs that no longer exist and
-deletes their state (amortised, index-driven, never a `SCAN`). For near-real-time reclamation,
-attach a `QueueEvents` you already own — it reuses your connection and is purely an accelerator;
-correctness never depends on it:
+Reclamation is observational and **eventually consistent** — there is no event listener and no
+real-time promise. The policy:
 
-```ts
-const queueEvents = new QueueEvents("generation", { connection })
-worker.attachQueueEvents(queueEvents) // or queue.attachQueueEvents(queueEvents)
-```
-
-With events attached, a `removed` job's state is reaped immediately (a job removed *mid-flight*
-auto-marks its run `cancelled`), and `cleaned` triggers a batch pass.
+- **Synchronous** — `DurableQueue.clean()` / `drain()` / `obliterate()` settle durable state in
+  the same call (see below).
+- **Amortised** — the reaper runs on worker start, after every terminal outcome, on
+  durable-state reads, and on an explicit `queue.reconcile()`. Each pass checks a small batch of
+  the oldest finished runs for jobs that no longer exist and deletes their state (index-driven,
+  never a `SCAN`).
+- **External deletions** — if a job is removed directly through BullMQ (`job.remove()`,
+  bull-board, a raw `Queue`), its durable state converges at the next reaper trigger. A
+  non-terminal orphan is marked `cancelled` once it has been quiet for `reaper.orphanGraceMs`
+  (default 10s), then collected.
 
 Bulk queue maintenance stays in sync because `DurableQueue` overrides the three bulk methods as
 pass-throughs that also settle durable state:
@@ -747,23 +748,40 @@ new DurableWorker("generation", {
 `DurableQueueOptions` **extends BullMQ's `QueueOptions`** — every native option (`connection`,
 `prefix`, `defaultJobOptions`, …) passes through untouched. On top of that:
 
-| Option           | Type         | Description                                              |
-| ---------------- | ------------ | -------------------------------------------------------- |
-| `stateStore?`    | `StateStore` | Custom store (defaults to `RedisStateStore`).            |
-| `durablePrefix?` | `string`     | Redis key prefix for durable state (`"bullmq-durable"`). |
+| Option           | Type                  | Description                                              |
+| ---------------- | --------------------- | -------------------------------------------------------- |
+| `stateStore?`    | `StateStore`          | Custom store (defaults to `RedisStateStore`).            |
+| `durablePrefix?` | `string`              | Redis key prefix for durable state (`"bullmq-durable"`). |
+| `bullmq?`        | `Queue`               | Reuse an existing BullMQ `Queue` (same name) instead of opening one; ownership stays with you — `close()` won't touch it. |
+| `reaper?`        | `DurableReaperConfig` | Reaper tuning: `terminalBatchSize` (default 32), `throttleMs` (5s), `orphanGraceMs` (60s). |
 
 Deprecated (warn once, removed in 0.3.0): `bullPrefix` → `prefix`, `resumeAttempts` (ignored).
 
-Methods: `add(name, data, opts?)`, `getDurableState(jobId)`, `getDurableSteps(jobId)`,
-`getDurableLogs(jobId)`, `cancel(jobId)`, `clean(graceMs, limit, type?)`, `drain(delayed?)`,
+Methods: `add(name, data, opts?)`, `run(jobId)` / `getRun(jobId)` (vend a `DurableRun`),
+`listRuns({ kind, window })` (recency windows), `listRunsPage({ kind, offset, limit, order? })`
+(exact zset pages of one terminal bucket — use this for pagination), `countRuns()`,
+`activeRuns()`, `summarizeRuns(runs, { stuckThresholdMs })`, `reconcile()`,
+`getDurableState(jobId)`, `getDurableSteps(jobId)`, `getDurableLogs(jobId)`, `cancel(jobId)`,
+`clean(graceMs, limit, type?)`, `drain(delayed?)`,
 `obliterate(opts?)` (state-synced overrides — [State follows the job](#state-follows-the-job)),
-`attachQueueEvents(queueEvents)`, `instanceIdFor(jobId)`, `close()`, and `.bull` (the underlying BullMQ queue).
+`instanceIdFor(jobId)`, `close()`, and `.bullmq` (the underlying BullMQ queue).
 
 #### `new DurableWorker(name, processor, options)`
 
-`processor` is either a single `(job, ctx) => result` function, or a `{ [jobName]: handler }` map
-where each handler is a processor function or a `{ run, onFailure }` object (see
-[Compensation & failure handling](#compensation--failure-handling)).
+`processor` takes three forms (see
+[Compensation & failure handling](#compensation--failure-handling) for `onFailure`):
+
+```ts
+new DurableWorker("q", async (job, ctx) => {...}, opts)            // one function, every job
+new DurableWorker("q", { run: processor, onFailure }, opts)        // default handler for the queue
+new DurableWorker("q", { video: fn, image: { run, onFailure } }, opts) // per-job-name map
+```
+
+The top-level `{ run, onFailure }` form fits the common "one queue = one
+workflow" shape, where the job name is just a label and `onFailure` belongs
+with the processor. Disambiguation makes `run` a reserved word in the map
+form — a worker that really has a job named `"run"` uses the object entry:
+`{ run: { run: handleRunJob } }`.
 
 `DurableWorkerOptions` **extends BullMQ's `WorkerOptions`** — `concurrency`, `prefix`,
 `lockDuration`, `stalledInterval`, `maxStalledCount`, `limiter`, `settings.backoffStrategy`, …
@@ -776,11 +794,12 @@ all pass through untouched. On top of that:
 | `defaultStepOptions?`   | `StepOptions`           | Defaults merged into every `ctx.step` call.                            |
 | `defaultRollbackRetry?` | `RetryOptions`          | Retry policy for bare `onRollback` compensations (default `{ attempts: 5, backoff: { type: "exponential", delay: "1s", maxDelay: "30s" } }`). |
 | `onFailure?`            | `DurableFailureHandler` | Worker-wide terminal-failure handler for jobs without their own.       |
+| `reaper?`               | `DurableReaperConfig`   | Reaper tuning: `terminalBatchSize` (default 32), `throttleMs` (5s), `orphanGraceMs` (60s). |
 
 Deprecated (warn once, removed in 0.3.0): `bullPrefix` → `prefix`, `bullWorkerOptions` → top
 level, `lockTimeout` / `retention` / `maxLogs` / `resumeAttempts` (ignored).
 
-Methods: `attachQueueEvents(queueEvents)`, `on(event, listener)`, `waitUntilReady()`, `close()`,
+Methods: `on(event, listener)`, `waitUntilReady()`, `close()`,
 `.worker` (the underlying BullMQ worker), and `.stateStore`.
 
 #### `ctx`

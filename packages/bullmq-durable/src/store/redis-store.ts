@@ -44,6 +44,33 @@ export interface RedisStateStoreOptions {
   prefix?: string
 }
 
+// Shared Lua fragments, composed into the scripts below.
+//
+// Index keys are built INSIDE the scripts from prefix + queueName (per-queue
+// buckets). Dynamic key construction is not Redis-Cluster-safe — the same
+// caveat as BullMQ's own scripts; single-node/replicated Redis is the target.
+
+// Read a whole hash as one JSON blob (single-round-trip state returns).
+const LUA_DUMP_HASH = `
+local function dumpHash(key)
+  local flat = redis.call('HGETALL', key)
+  local hash = {}
+  for i = 1, #flat, 2 do hash[flat[i]] = flat[i + 1] end
+  return cjson.encode(hash)
+end
+`
+
+// Drop an id from every done bucket (per-queue + pre-release legacy global).
+// The status list must stay in lockstep with TERMINAL_STATUSES in utils/keys.
+const LUA_CLEAR_DONE_BUCKETS = `
+local function clearDoneBuckets(idx, prefix, id)
+  for _, st in ipairs({'completed', 'failed', 'cancelled', 'compensation_failed'}) do
+    redis.call('ZREM', idx .. ':done:' .. st, id)
+    redis.call('ZREM', prefix .. ':idx:done:' .. st, id)
+  end
+end
+`
+
 // Begin an execution tick, in one round-trip. Creates the instance when absent
 // (fields supplied by the caller; fresh instances join the active set and any
 // stale done-bucket entry from a PRIOR run under a reused job id is cleared).
@@ -52,42 +79,30 @@ export interface RedisStateStoreOptions {
 // instances come back untouched. Returning the hash from the same script keeps
 // the common resumed-tick path at a single round-trip.
 //
-// Index keys are built INSIDE the scripts from prefix + queueName (per-queue
-// buckets). Dynamic key construction is not Redis-Cluster-safe — the same
-// caveat as BullMQ's own scripts; single-node/replicated Redis is the target.
-//
 // KEYS: [1] instance.
-// ARGV: [1] instance id, [2] now (ms), [3] durable prefix, [4] queue name,
-//       [5..] HSET field pairs for creation.
-const BEGIN_TICK_SCRIPT = `
-local function dump(key)
-  local flat = redis.call('HGETALL', key)
-  local hash = {}
-  for i = 1, #flat, 2 do hash[flat[i]] = flat[i + 1] end
-  return cjson.encode(hash)
-end
-local idx = ARGV[3] .. ':idx:' .. ARGV[4]
+// ARGV: named in the header line; [CREATE_FIELDS_FROM..] HSET pairs for creation.
+const BEGIN_TICK_SCRIPT = LUA_DUMP_HASH + LUA_CLEAR_DONE_BUCKETS + `
+local id, now, prefix, queueName = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+local CREATE_FIELDS_FROM = 5
+local idx = prefix .. ':idx:' .. queueName
 if redis.call('EXISTS', KEYS[1]) == 1 then
   local status = redis.call('HGET', KEYS[1], 'status')
   if status == 'completed' or status == 'failed'
       or status == 'compensation_failed' or status == 'cancelled' then
-    return {'terminal', dump(KEYS[1])}
+    return {'terminal', dumpHash(KEYS[1])}
   end
   redis.call('HINCRBY', KEYS[1], 'runCount', 1)
   if status ~= 'compensating' then
     redis.call('HSET', KEYS[1], 'status', 'running')
   end
-  redis.call('HSET', KEYS[1], 'updatedAt', ARGV[2])
-  redis.call('SADD', idx .. ':active', ARGV[1])
-  return {'tick', dump(KEYS[1])}
+  redis.call('HSET', KEYS[1], 'updatedAt', now)
+  redis.call('SADD', idx .. ':active', id)
+  return {'tick', dumpHash(KEYS[1])}
 end
-redis.call('HSET', KEYS[1], unpack(ARGV, 5))
-redis.call('SADD', ARGV[3] .. ':queues', ARGV[4])
-for _, st in ipairs({'completed', 'failed', 'cancelled', 'compensation_failed'}) do
-  redis.call('ZREM', idx .. ':done:' .. st, ARGV[1])
-  redis.call('ZREM', ARGV[3] .. ':idx:done:' .. st, ARGV[1])
-end
-redis.call('SADD', idx .. ':active', ARGV[1])
+redis.call('HSET', KEYS[1], unpack(ARGV, CREATE_FIELDS_FROM))
+redis.call('SADD', prefix .. ':queues', queueName)
+clearDoneBuckets(idx, prefix, id)
+redis.call('SADD', idx .. ':active', id)
 return {'created', ''}
 `
 
@@ -96,34 +111,31 @@ return {'created', ''}
 // tick) cannot conjure a half-populated "zombie" instance.
 //
 // KEYS: [1] instance hash.
-// ARGV: [1] instance id, [2] new status ('' when the patch doesn't change it),
-//       [3] terminal score (transition timestamp), [4] durable prefix,
-//       [5..] HSET field pairs.
+// ARGV: named in the header line ('' status = patch doesn't change it);
+//       [PATCH_FIELDS_FROM..] HSET field pairs.
 // The index is maintained ONLY on a real status transition, atomically with the
 // patch: terminal statuses leave the active set and enter their done-bucket;
 // running/yielded/compensating stays active (SADD is idempotent, covering the
 // backfill case where an in-flight instance wasn't yet indexed).
-const UPDATE_SCRIPT = `
+const UPDATE_SCRIPT = LUA_CLEAR_DONE_BUCKETS + `
+local id, newStatus, score, prefix = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+local PATCH_FIELDS_FROM = 5
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 0
 end
 local old = redis.call('HGET', KEYS[1], 'status')
 local q = redis.call('HGET', KEYS[1], 'queueName')
-redis.call('HSET', KEYS[1], unpack(ARGV, 5))
-local new = ARGV[2]
-if new ~= '' and new ~= old and q then
-  local idx = ARGV[4] .. ':idx:' .. q
-  if new == 'completed' or new == 'failed' or new == 'cancelled'
-      or new == 'compensation_failed' then
-    redis.call('SREM', idx .. ':active', ARGV[1])
-    redis.call('SREM', ARGV[4] .. ':idx:active', ARGV[1])
-    redis.call('ZADD', idx .. ':done:' .. new, ARGV[3], ARGV[1])
+redis.call('HSET', KEYS[1], unpack(ARGV, PATCH_FIELDS_FROM))
+if newStatus ~= '' and newStatus ~= old and q then
+  local idx = prefix .. ':idx:' .. q
+  if newStatus == 'completed' or newStatus == 'failed' or newStatus == 'cancelled'
+      or newStatus == 'compensation_failed' then
+    redis.call('SREM', idx .. ':active', id)
+    redis.call('SREM', prefix .. ':idx:active', id)
+    redis.call('ZADD', idx .. ':done:' .. newStatus, score, id)
   else
-    for _, st in ipairs({'completed', 'failed', 'cancelled', 'compensation_failed'}) do
-      redis.call('ZREM', idx .. ':done:' .. st, ARGV[1])
-      redis.call('ZREM', ARGV[4] .. ':idx:done:' .. st, ARGV[1])
-    end
-    redis.call('SADD', idx .. ':active', ARGV[1])
+    clearDoneBuckets(idx, prefix, id)
+    redis.call('SADD', idx .. ':active', id)
   end
 end
 return 1
@@ -137,25 +149,27 @@ return 1
 // fences job-state transitions; this fences OUR state the same way).
 //
 // KEYS: [1] instance, [2] lock.
-// ARGV: [1] instance id, [2] score (now), [3] lock token ('' = unfenced),
-//       [4] durable prefix, [5] terminal status, [6..] HSET field pairs.
+// ARGV: named in the header line ('' lock token = unfenced);
+//       [PATCH_FIELDS_FROM..] HSET field pairs.
 const TERMINAL_SCRIPT = `
+local id, score, lockToken, prefix, status = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
+local PATCH_FIELDS_FROM = 6
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 0
 end
-if ARGV[3] ~= '' then
+if lockToken ~= '' then
   local cur = redis.call('GET', KEYS[2])
-  if cur ~= false and cur ~= ARGV[3] then
+  if cur ~= false and cur ~= lockToken then
     return -1
   end
 end
 local q = redis.call('HGET', KEYS[1], 'queueName')
-redis.call('HSET', KEYS[1], unpack(ARGV, 6))
+redis.call('HSET', KEYS[1], unpack(ARGV, PATCH_FIELDS_FROM))
 if q then
-  local idx = ARGV[4] .. ':idx:' .. q
-  redis.call('SREM', idx .. ':active', ARGV[1])
-  redis.call('SREM', ARGV[4] .. ':idx:active', ARGV[1])
-  redis.call('ZADD', idx .. ':done:' .. ARGV[5], ARGV[2], ARGV[1])
+  local idx = prefix .. ':idx:' .. q
+  redis.call('SREM', idx .. ':active', id)
+  redis.call('SREM', prefix .. ':idx:active', id)
+  redis.call('ZADD', idx .. ':done:' .. status, score, id)
 end
 return 1
 `
@@ -164,9 +178,10 @@ return 1
 // new step — seq allocation plus the initial `running` record, atomically.
 //
 // KEYS: [1] instance, [2] steps.
-// ARGV: [1] storage key (phase-namespaced), [2] logical key, [3] type,
-//       [4] phase, [5] now (ms), [6] nextRunAt ('' = none).
+// ARGV: named in the header line ('' nextRunAt = none).
 const BEGIN_STEP_SCRIPT = `
+local storageKey, key, stepType, phase, now, nextRunAt =
+  ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6]
 local status = redis.call('HGET', KEYS[1], 'status')
 if status == false then
   return {'missing', ''}
@@ -174,47 +189,50 @@ end
 if status == 'cancelled' then
   return {'cancelled', ''}
 end
-local raw = redis.call('HGET', KEYS[2], ARGV[1])
+local raw = redis.call('HGET', KEYS[2], storageKey)
 if raw then
   return {'existing', raw}
 end
 local seq = redis.call('HINCRBY', KEYS[1], 'stepSeq', 1)
 local state = {
-  key = ARGV[2],
-  type = ARGV[3],
-  phase = ARGV[4],
+  key = key,
+  type = stepType,
+  phase = phase,
   seq = seq,
   status = 'running',
   attempts = 1,
-  startedAt = tonumber(ARGV[5]),
+  startedAt = tonumber(now),
 }
-if ARGV[6] ~= '' then
-  state.nextRunAt = tonumber(ARGV[6])
+if nextRunAt ~= '' then
+  state.nextRunAt = tonumber(nextRunAt)
 end
-redis.call('HSET', KEYS[2], ARGV[1], cjson.encode(state))
-redis.call('HSET', KEYS[1], 'updatedAt', ARGV[5])
+redis.call('HSET', KEYS[2], storageKey, cjson.encode(state))
+redis.call('HSET', KEYS[1], 'updatedAt', now)
 return {'created', tostring(seq)}
 `
 
 // Acquire or re-enter a lock: succeeds if the lock is free or already ours.
 const LOCK_ACQUIRE_SCRIPT = `
+local token, ttlMs = ARGV[1], ARGV[2]
 local cur = redis.call('GET', KEYS[1])
-if cur == false or cur == ARGV[1] then
-  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+if cur == false or cur == token then
+  redis.call('SET', KEYS[1], token, 'PX', ttlMs)
   return 1
 end
 return 0
 `
 
 const LOCK_RENEW_SCRIPT = `
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+local token, ttlMs = ARGV[1], ARGV[2]
+if redis.call('GET', KEYS[1]) == token then
+  return redis.call('PEXPIRE', KEYS[1], ttlMs)
 end
 return 0
 `
 
 const LOCK_RELEASE_SCRIPT = `
-if redis.call('GET', KEYS[1]) == ARGV[1] then
+local token = ARGV[1]
+if redis.call('GET', KEYS[1]) == token then
   return redis.call('DEL', KEYS[1])
 end
 return 0
@@ -255,14 +273,12 @@ export class RedisStateStore implements StateStore {
       updatedAt: now,
     }
 
-    const [outcome, dumped] = (await this.cmd("durableBeginTick")(
-      this.instanceKey(input.instanceId),
-      input.instanceId,
-      String(now),
-      this.prefix,
-      input.queueName,
-      ...encodeInstanceFields(fresh),
-    )) as [string, string]
+    const [outcome, dumped] = await this.runBeginTickScript({
+      instanceId: input.instanceId,
+      now,
+      queueName: input.queueName,
+      createFields: encodeInstanceFields(fresh),
+    })
 
     if (outcome === "created") return fresh
     return parseInstance(
@@ -300,17 +316,15 @@ export class RedisStateStore implements StateStore {
     const fields = encodeInstanceFields({ ...patch, updatedAt: patch.updatedAt ?? Date.now() })
     if (fields.length === 0) return this.getInstance(instanceId)
 
-    // Index keys + transition control args precede the HSET field pairs. A patch
-    // that doesn't set `status` passes "" so the Lua skips all index work — the
-    // common non-transition update (runCount / output) costs nothing extra.
-    const updated = (await this.cmd("durableUpdate")(
-      this.instanceKey(instanceId),
+    // A patch that doesn't set `status` passes "" so the Lua skips all index
+    // work — the common non-transition update (runCount / output) costs
+    // nothing extra.
+    const updated = await this.runUpdateScript({
       instanceId,
-      patch.status ?? "",
-      String(Date.now()),
-      this.prefix,
-      ...fields,
-    )) as number
+      newStatus: patch.status ?? "",
+      score: Date.now(),
+      patchFields: fields,
+    })
     if (updated === 0) return null
     return this.getInstance(instanceId)
   }
@@ -378,16 +392,13 @@ export class RedisStateStore implements StateStore {
     patch: Partial<InstanceState>,
     lockToken: string | undefined,
   ): Promise<boolean> {
-    const result = (await this.cmd("durableTerminal")(
-      this.instanceKey(instanceId),
-      this.lockKey(instanceId),
+    const result = await this.runTerminalScript({
       instanceId,
-      String(Date.now()),
-      lockToken ?? "",
-      this.prefix,
+      score: Date.now(),
+      lockToken,
       status,
-      ...encodeInstanceFields(patch),
-    )) as number
+      patchFields: encodeInstanceFields(patch),
+    })
     return result === 1
   }
 
@@ -398,16 +409,11 @@ export class RedisStateStore implements StateStore {
     stepKey: string,
     init: BeginStepInit,
   ): Promise<BeginStepResult> {
-    const [outcome, payload] = (await this.cmd("durableBeginStep")(
-      this.instanceKey(instanceId),
-      this.stepsKey(instanceId),
-      stepKey,
-      init.key,
-      init.type,
-      init.phase,
-      String(init.now),
-      init.nextRunAt !== undefined ? String(init.nextRunAt) : "",
-    )) as [string, string]
+    const [outcome, payload] = await this.runBeginStepScript({
+      instanceId,
+      storageKey: stepKey,
+      init,
+    })
 
     switch (outcome) {
       case "missing":
@@ -466,6 +472,7 @@ export class RedisStateStore implements StateStore {
   async acquireLock(instanceId: string, token: string, ttlMs: number): Promise<boolean> {
     const result = (await this.cmd("durableLockAcquire")(
       this.lockKey(instanceId),
+      // ARGV: token, ttlMs — named in the script header.
       token,
       String(ttlMs),
     )) as number
@@ -483,6 +490,83 @@ export class RedisStateStore implements StateStore {
 
   async releaseLock(instanceId: string, token: string): Promise<void> {
     await this.cmd("durableLockRelease")(this.lockKey(instanceId), token)
+  }
+
+  // -- Lua command wrappers ---------------------------------------------------
+  // Each wrapper is the single owner of its script's positional wire order:
+  // the tuple built here lines up 1:1 with the named-locals header line at the
+  // top of the corresponding script. Call sites only ever pass named fields.
+
+  private runBeginTickScript(p: {
+    instanceId: string
+    now: number
+    queueName: string
+    createFields: string[]
+  }): Promise<[outcome: string, dumpedHash: string]> {
+    return this.cmd("durableBeginTick")(
+      this.instanceKey(p.instanceId),
+      // local id, now, prefix, queueName = ARGV[1..4]; [5..] create pairs
+      p.instanceId,
+      String(p.now),
+      this.prefix,
+      p.queueName,
+      ...p.createFields,
+    ) as Promise<[string, string]>
+  }
+
+  private runUpdateScript(p: {
+    instanceId: string
+    newStatus: InstanceStatus | ""
+    score: number
+    patchFields: string[]
+  }): Promise<number> {
+    return this.cmd("durableUpdate")(
+      this.instanceKey(p.instanceId),
+      // local id, newStatus, score, prefix = ARGV[1..4]; [5..] patch pairs
+      p.instanceId,
+      p.newStatus,
+      String(p.score),
+      this.prefix,
+      ...p.patchFields,
+    ) as Promise<number>
+  }
+
+  private runTerminalScript(p: {
+    instanceId: string
+    score: number
+    lockToken: string | undefined
+    status: TerminalStatus
+    patchFields: string[]
+  }): Promise<number> {
+    return this.cmd("durableTerminal")(
+      this.instanceKey(p.instanceId),
+      this.lockKey(p.instanceId),
+      // local id, score, lockToken, prefix, status = ARGV[1..5]; [6..] patch pairs
+      p.instanceId,
+      String(p.score),
+      p.lockToken ?? "",
+      this.prefix,
+      p.status,
+      ...p.patchFields,
+    ) as Promise<number>
+  }
+
+  private runBeginStepScript(p: {
+    instanceId: string
+    storageKey: string
+    init: BeginStepInit
+  }): Promise<[outcome: string, payload: string]> {
+    return this.cmd("durableBeginStep")(
+      this.instanceKey(p.instanceId),
+      this.stepsKey(p.instanceId),
+      // local storageKey, key, stepType, phase, now, nextRunAt = ARGV[1..6]
+      p.storageKey,
+      p.init.key,
+      p.init.type,
+      p.init.phase,
+      String(p.init.now),
+      p.init.nextRunAt !== undefined ? String(p.init.nextRunAt) : "",
+    ) as Promise<[string, string]>
   }
 
   // -- Reaper primitives -----------------------------------------------------
@@ -542,6 +626,40 @@ export class RedisStateStore implements StateStore {
     ).filter((id) => id.startsWith(`${queueName}:`))
     if (legacy.length === 0) return current
     return [...new Set([...current, ...legacy])].slice(0, limit)
+  }
+
+  async listTerminalPage(
+    queueName: string,
+    status: TerminalStatus,
+    query: { offset: number; limit: number; order: "asc" | "desc" },
+  ): Promise<string[]> {
+    const { offset, limit, order } = query
+    if (limit <= 0) return []
+    const key = terminalIndexKey(this.prefix, queueName, status)
+    const primary =
+      order === "asc"
+        ? await this.redis.zrange(key, offset, offset + limit - 1)
+        : await this.redis.zrevrange(key, offset, offset + limit - 1)
+    if (primary.length >= limit) return primary
+
+    // Transition window (0.3.0 removes it): 0.1.x leftovers live in a global
+    // bucket. Treat this queue's filtered leftovers as appended AFTER the
+    // per-queue bucket — same convention as the window reads.
+    const legacyAll = (
+      await (order === "asc"
+        ? this.redis.zrange(legacyTerminalIndexKey(this.prefix, status), 0, -1)
+        : this.redis.zrevrange(legacyTerminalIndexKey(this.prefix, status), 0, -1)
+      ).catch(() => [] as string[])
+    ).filter((id) => id.startsWith(`${queueName}:`))
+    if (legacyAll.length === 0) return primary
+
+    const primaryTotal = await this.redis.zcard(key)
+    const seen = new Set(primary)
+    const legacyOffset = Math.max(0, offset - primaryTotal)
+    const topUp = legacyAll
+      .filter((id) => !seen.has(id))
+      .slice(legacyOffset, legacyOffset + (limit - primary.length))
+    return [...primary, ...topUp]
   }
 
   async countTerminal(queueName: string, status: TerminalStatus): Promise<number> {
