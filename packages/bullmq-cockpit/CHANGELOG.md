@@ -32,6 +32,17 @@ upgrade.
   queue and the default recency sort the offset is pushed down to Redis, so
   deep pages stay exact with no hard cap; cross-queue listings merge exact
   per-queue pages.
+- **`durable.enabled` defaults to `"auto"`** — the README's "auto-detected"
+  is now literally true: the cockpit probes the runtime's marker keys (one
+  variadic `EXISTS` on the shared client, sticky once positive, re-checked
+  every 30s while negative) and lights the durable UI up only when
+  `bullmq-durable` is actually in use. A plain-BullMQ deployment pays one
+  `EXISTS` per 30s and nothing else: no extra Redis connection (the runtime
+  store dials lazily), no empty Durable nav, and the legacy 0.1.x
+  orphan-resume scan — the one health check that hydrates real jobs — only
+  runs while legacy markers exist. `true`/`false` remain as explicit
+  overrides. The overview/health active-population summary is additionally
+  single-flighted for 2s so simultaneous panels share one read.
 - **NestJS: `forRoot` / `forRootAsync`** are the canonical module methods
   (mirroring `BullModule.forRoot`); `register` / `registerAsync` remain as
   aliases. The adapter no longer swallows a `queues` THUNK passed through the

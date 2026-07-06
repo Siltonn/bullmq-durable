@@ -7,6 +7,7 @@
  */
 
 import { Queue } from "bullmq"
+import { durableProbeKeys } from "bullmq-durable"
 import type { Redis } from "ioredis"
 import {
   AlertsInspector,
@@ -34,6 +35,14 @@ export interface BoardContext {
   requireQueue: (name: string) => Promise<Queue>
   bullmq: BullMQInspector
   durable?: DurableInspector
+  /**
+   * Whether the durable UI/reads should be live right now: `false`/`true`
+   * for the explicit settings; under `"auto"` a TTL-cached probe of the
+   * runtime's marker keys (sticky once positive, re-checked every 30s while
+   * negative) on the shared client. Display-layer cost for a plain BullMQ
+   * deployment: one `EXISTS` per 30s, nothing else.
+   */
+  detectDurable: () => Promise<boolean>
   health: HealthInspector
   alerts: AlertsInspector
   /** Tear down every connection this context opened. */
@@ -53,14 +62,39 @@ export function createBoardContext(options: NormalizedCockpitOptions): BoardCont
     return queue
   }
 
-  const durable = options.durable.enabled
-    ? new DurableInspector({
-        redis,
-        prefix: options.durable.prefix,
-        stuckThresholdMs: options.durable.stuckThresholdMs,
-        getQueue,
-      })
-    : undefined
+  // Constructing the inspector is free since the runtime's store dials Redis
+  // lazily — gating happens at the read entry points via `detectDurable`.
+  const durable =
+    options.durable.enabled !== false
+      ? new DurableInspector({
+          redis,
+          prefix: options.durable.prefix,
+          stuckThresholdMs: options.durable.stuckThresholdMs,
+          getQueue,
+        })
+      : undefined
+
+  const probes = durableProbeKeys(options.durable.prefix)
+  let detected: { at: number; value: boolean } | undefined
+  const detectDurable = async (): Promise<boolean> => {
+    if (options.durable.enabled !== "auto") return options.durable.enabled
+    const now = Date.now()
+    if (detected && (detected.value || now - detected.at < 30_000)) return detected.value
+    const value = (await redis.exists(...probes.any).catch(() => 0)) > 0
+    detected = { at: now, value }
+    return value
+  }
+  // The 0.1.x legacy markers gate the (hydrating) orphan-resume-job scan —
+  // re-probed both ways: legacy data shrinks away as it is reaped.
+  let legacy: { at: number; value: boolean } | undefined
+  const legacyDurablePresent = async (): Promise<boolean> => {
+    if (options.durable.enabled === false) return false
+    const now = Date.now()
+    if (legacy && now - legacy.at < 60_000) return legacy.value
+    const value = (await redis.exists(...probes.legacy).catch(() => 0)) > 0
+    legacy = { at: now, value }
+    return value
+  }
 
   const bullmq = createBullMQInspector({
     redis,
@@ -74,7 +108,8 @@ export function createBoardContext(options: NormalizedCockpitOptions): BoardCont
     redis,
     bullmq,
     durable,
-    durableEnabled: options.durable.enabled,
+    detectDurable,
+    legacyDurablePresent,
     stuckThresholdMs: options.durable.stuckThresholdMs,
     getQueue,
   })
@@ -84,7 +119,9 @@ export function createBoardContext(options: NormalizedCockpitOptions): BoardCont
     prefix: options.cockpitPrefix,
     bullmq,
     health,
-    durableEnabled: options.durable.enabled,
+    // Auto counts as enabled here: the stuck metric itself is probe-gated
+    // inside health, so an absent durable deployment evaluates to zero work.
+    durableEnabled: options.durable.enabled !== false,
   })
 
   // Known-queue gate for client-supplied names. Discovery is cached briefly so
@@ -123,5 +160,16 @@ export function createBoardContext(options: NormalizedCockpitOptions): BoardCont
     ])
   }
 
-  return { options, redis, getQueue, requireQueue, bullmq, durable, health, alerts, close }
+  return {
+    options,
+    redis,
+    getQueue,
+    requireQueue,
+    bullmq,
+    durable,
+    detectDurable,
+    health,
+    alerts,
+    close,
+  }
 }

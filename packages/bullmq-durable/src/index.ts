@@ -62,7 +62,12 @@ export * from "./types"
 export * from "./store"
 
 export { type DurationInput, isDurationLike, parseDuration } from "./utils/duration"
-export { createInstanceId, DEFAULT_DURABLE_PREFIX, stepIdOf } from "./utils/keys"
+export {
+  createInstanceId,
+  DEFAULT_DURABLE_PREFIX,
+  durableProbeKeys,
+  stepIdOf,
+} from "./utils/keys"
 export {
   DURABLE_LOG_MARKER,
   DURABLE_LOG_VERSION,

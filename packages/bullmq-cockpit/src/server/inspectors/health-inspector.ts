@@ -29,7 +29,10 @@ export interface HealthInspectorDeps {
   redis: Redis
   bullmq: BullMQInspector
   durable?: DurableInspector
-  durableEnabled: boolean
+  /** Live "is durable in use?" (explicit setting, or the auto probe). */
+  detectDurable: () => Promise<boolean>
+  /** Whether 0.1.x legacy markers are present (gates the orphan-resume scan). */
+  legacyDurablePresent: () => Promise<boolean>
   stuckThresholdMs: number
   getQueue: (name: string) => Queue
 }
@@ -38,7 +41,8 @@ export class HealthInspector {
   private readonly redis: Redis
   private readonly bullmq: BullMQInspector
   private readonly durable?: DurableInspector
-  private readonly durableEnabled: boolean
+  private readonly detectDurable: () => Promise<boolean>
+  private readonly legacyDurablePresent: () => Promise<boolean>
   private readonly defaultThresholdMs: number
   private readonly getQueue: (name: string) => Queue
 
@@ -46,7 +50,8 @@ export class HealthInspector {
     this.redis = deps.redis
     this.bullmq = deps.bullmq
     this.durable = deps.durable
-    this.durableEnabled = deps.durableEnabled
+    this.detectDurable = deps.detectDurable
+    this.legacyDurablePresent = deps.legacyDurablePresent
     this.defaultThresholdMs = deps.stuckThresholdMs
     this.getQueue = deps.getQueue
   }
@@ -73,7 +78,7 @@ export class HealthInspector {
 
     return {
       redis: { ok: redisOk, latencyMs, error },
-      durableEnabled: this.durableEnabled,
+      durableEnabled: await this.detectDurable(),
       queues,
       generatedAt: Date.now(),
     }
@@ -83,7 +88,7 @@ export class HealthInspector {
     const threshold = thresholdMs ?? this.defaultThresholdMs
     const found: StuckInstance[] = []
 
-    if (this.durable) {
+    if (this.durable && (await this.detectDurable())) {
       // Every "stuck" kind is a non-terminal condition (running_stale /
       // resume_missed / orphan_instance), so the bounded active set is sufficient
       // — no full scan.
@@ -141,9 +146,14 @@ export class HealthInspector {
 
       // orphan_resume_job (LEGACY, 0.1.x rolling-upgrade window): a pending
       // envelope resume job whose instance no longer EXISTS. Removed in 0.3.0.
-      const queueNames = await this.bullmq.queueNames().catch(() => [])
-      for (const name of queueNames) {
-        found.push(...(await this.findOrphanResumeJobs(name)))
+      // This is the ONE scan that hydrates real jobs per queue — gated behind
+      // the legacy-marker probe so it costs nothing once (or if) no 0.1.x
+      // data exists: the display layer must never tax a clean deployment.
+      if (await this.legacyDurablePresent()) {
+        const queueNames = await this.bullmq.queueNames().catch(() => [])
+        for (const name of queueNames) {
+          found.push(...(await this.findOrphanResumeJobs(name)))
+        }
       }
     }
 

@@ -55,8 +55,14 @@ export type AuthHandler = (ctx: AuthContext) => Promise<AuthResult> | AuthResult
 // ---------------------------------------------------------------------------
 
 export interface DurableCockpitOptions {
-  /** Enable the durable instance inspector. Defaults to `true`. */
-  enabled?: boolean
+  /**
+   * Enable the durable instance inspector. Defaults to `"auto"`: probe Redis
+   * for durable state (one variadic `EXISTS` on runtime-published marker keys,
+   * re-checked periodically on the shared client — never a SCAN, no extra
+   * connection) and light the durable UI up only when `bullmq-durable` is
+   * actually in use. `true` forces it on; `false` disables it entirely.
+   */
+  enabled?: boolean | "auto"
   /** Redis key prefix used by `bullmq-durable`. Defaults to `"bullmq-durable"`. */
   prefix?: string
   /**
@@ -128,7 +134,7 @@ export interface BullMQCockpitOptions {
 // ---------------------------------------------------------------------------
 
 export interface NormalizedDurableOptions {
-  enabled: boolean
+  enabled: boolean | "auto"
   prefix: string
   stuckThresholdMs: number
 }
@@ -196,7 +202,7 @@ export function normalizeOptions(options: BullMQCockpitOptions): NormalizedCockp
     cockpitPrefix: options.cockpitPrefix ?? "bullmq-cockpit",
     basePath: normalizeBasePath(options.basePath),
     durable: {
-      enabled: options.durable?.enabled ?? true,
+      enabled: options.durable?.enabled ?? "auto",
       prefix: options.durable?.prefix ?? DEFAULT_DURABLE_PREFIX,
       stuckThresholdMs: options.durable?.stuckThresholdMs ?? DEFAULT_STUCK_THRESHOLD_MS,
     },

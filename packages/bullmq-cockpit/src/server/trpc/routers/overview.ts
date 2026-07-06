@@ -42,7 +42,10 @@ function clampWindow(windowMinutes: number | undefined): number {
 export const overviewRouter = router({
   stats: protectedProcedure("queue:read").query(async ({ ctx }): Promise<OverviewStats> => {
     const queues = await ctx.board.bullmq.listQueues()
-    const durable = ctx.board.durable ? await ctx.board.durable.statusCounts() : undefined
+    const durable =
+      ctx.board.durable && (await ctx.board.detectDurable())
+        ? await ctx.board.durable.statusCounts()
+        : undefined
     const topQueues = [...queues].sort((a, b) => busyness(b) - busyness(a)).slice(0, 6)
 
     return {

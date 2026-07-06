@@ -239,22 +239,33 @@ return 0
 `
 
 export class RedisStateStore implements StateStore {
-  private readonly redis: Redis
+  private client?: Redis
   private readonly prefix: string
 
-  constructor(options: RedisStateStoreOptions) {
+  constructor(private readonly options: RedisStateStoreOptions) {
     this.prefix = options.prefix ?? DEFAULT_DURABLE_PREFIX
-    this.redis = createClient(options.connection)
+  }
 
-    // Register the Lua helpers as cached, named commands. The key counts must
-    // match each script's KEYS arity (see the script comments above).
-    this.redis.defineCommand("durableBeginTick", { numberOfKeys: 1, lua: BEGIN_TICK_SCRIPT })
-    this.redis.defineCommand("durableUpdate", { numberOfKeys: 1, lua: UPDATE_SCRIPT })
-    this.redis.defineCommand("durableTerminal", { numberOfKeys: 2, lua: TERMINAL_SCRIPT })
-    this.redis.defineCommand("durableBeginStep", { numberOfKeys: 2, lua: BEGIN_STEP_SCRIPT })
-    this.redis.defineCommand("durableLockAcquire", { numberOfKeys: 1, lua: LOCK_ACQUIRE_SCRIPT })
-    this.redis.defineCommand("durableLockRenew", { numberOfKeys: 1, lua: LOCK_RENEW_SCRIPT })
-    this.redis.defineCommand("durableLockRelease", { numberOfKeys: 1, lua: LOCK_RELEASE_SCRIPT })
+  /**
+   * Lazily open the connection on first use — merely constructing a store
+   * (e.g. a dashboard probing whether durable is deployed at all) must not
+   * cost a Redis connection.
+   */
+  private get redis(): Redis {
+    if (!this.client) {
+      this.client = createClient(this.options.connection)
+
+      // Register the Lua helpers as cached, named commands. The key counts must
+      // match each script's KEYS arity (see the script comments above).
+      this.client.defineCommand("durableBeginTick", { numberOfKeys: 1, lua: BEGIN_TICK_SCRIPT })
+      this.client.defineCommand("durableUpdate", { numberOfKeys: 1, lua: UPDATE_SCRIPT })
+      this.client.defineCommand("durableTerminal", { numberOfKeys: 2, lua: TERMINAL_SCRIPT })
+      this.client.defineCommand("durableBeginStep", { numberOfKeys: 2, lua: BEGIN_STEP_SCRIPT })
+      this.client.defineCommand("durableLockAcquire", { numberOfKeys: 1, lua: LOCK_ACQUIRE_SCRIPT })
+      this.client.defineCommand("durableLockRenew", { numberOfKeys: 1, lua: LOCK_RENEW_SCRIPT })
+      this.client.defineCommand("durableLockRelease", { numberOfKeys: 1, lua: LOCK_RELEASE_SCRIPT })
+    }
+    return this.client
   }
 
   // -- Instance lifecycle --------------------------------------------------
@@ -575,6 +586,10 @@ export class RedisStateStore implements StateStore {
     return this.redis.smembers(queuesRegistryKey(this.prefix))
   }
 
+  async registerQueue(queueName: string): Promise<void> {
+    await this.redis.sadd(queuesRegistryKey(this.prefix), queueName)
+  }
+
   async listActive(queueName: string): Promise<string[]> {
     const [current, legacy] = await Promise.all([
       this.redis.smembers(activeIndexKey(this.prefix, queueName)),
@@ -794,7 +809,9 @@ export class RedisStateStore implements StateStore {
   // -- Lifecycle -----------------------------------------------------------
 
   async close(): Promise<void> {
-    await this.redis.quit()
+    // Only quit a connection that was actually opened — closing a never-used
+    // store must not dial Redis just to hang up.
+    if (this.client) await this.client.quit()
   }
 
   // -- Internals -----------------------------------------------------------

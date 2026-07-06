@@ -12,6 +12,7 @@ import type { DurableContext, DurableJob } from "../src/index"
 import { DurableQueue } from "../src/index"
 import { DurableReaper, bullJobKeysExist } from "../src/reaper"
 import { RedisStateStore } from "../src/store/redis-store"
+import { durableProbeKeys } from "../src/utils/keys"
 import type { StepState } from "../src/types"
 import { TestEngine } from "./helpers/engine"
 
@@ -372,6 +373,29 @@ describeRedis("RedisStateStore (integration)", () => {
           order: "desc",
         }),
       ).toEqual([])
+    })
+
+    it("registerQueue announces a queue before any run; probe keys detect it", async () => {
+      const probePrefix = `${prefix}:probe`
+      const probeStore = new RedisStateStore({
+        connection: { host: REDIS_HOST, port: REDIS_PORT },
+        prefix: probePrefix,
+      })
+      try {
+        const keys = durableProbeKeys(probePrefix)
+        // Fresh deployment: nothing to detect yet.
+        expect(await admin.exists(...keys.any)).toBe(0)
+
+        // A worker startup announcement alone flips detection — no run needed.
+        await probeStore.registerQueue("q")
+        expect(await probeStore.queues()).toEqual(["q"])
+        expect(await admin.exists(...keys.any)).toBeGreaterThan(0)
+        // ...but the legacy subset stays silent (no 0.1.x markers here).
+        expect(await admin.exists(...keys.legacy)).toBe(0)
+      } finally {
+        await admin.del(...durableProbeKeys(probePrefix).any)
+        await probeStore.close()
+      }
     })
 
     it("listActive reflects the active set; wipeAll clears everything", async () => {

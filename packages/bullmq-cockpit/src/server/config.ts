@@ -13,14 +13,14 @@ import type { BoardPermission, BoardUser, CockpitConfig } from "../shared/dto"
 import type { BoardContext } from "./context"
 import { effectivePermissions } from "./middleware/auth"
 
-export function buildCockpitConfig(
+export async function buildCockpitConfig(
   board: BoardContext,
   permissions: BoardPermission[],
   user: BoardUser | undefined,
-): CockpitConfig {
+): Promise<CockpitConfig> {
   return {
     basePath: board.options.basePath,
-    durableEnabled: board.options.durable.enabled,
+    durableEnabled: await board.detectDurable(),
     readonly: board.options.readonly,
     permissions: effectivePermissions(board, permissions),
     user,

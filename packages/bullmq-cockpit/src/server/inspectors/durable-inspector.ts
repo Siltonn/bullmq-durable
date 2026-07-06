@@ -59,6 +59,9 @@ const TERMINAL_STATUSES = ["completed", "failed", "compensation_failed", "cancel
  *  this window is reported as `truncated` — the list never falls back to a scan. */
 const LIST_HARD_CAP = 2000
 
+/** Single-flight window for the active-population summary (overview + health). */
+const ACTIVE_SUMMARIES_TTL_MS = 2_000
+
 /** A zeroed count histogram, spread into every {@link DurableStatusCounts}. */
 const EMPTY_COUNTS = {
   running: 0,
@@ -273,8 +276,25 @@ export class DurableInspector {
   }
 
   /** Hydrate + summarize the bounded active (non-terminal) population. Shared
-   *  by the overview counts and the health inspector's stuck detection. */
+   *  by the overview counts and the health inspector's stuck detection —
+   *  which poll on the same cycle, so a short single-flight cache halves the
+   *  Redis work without meaningful staleness on a dashboard. */
   async activeSummaries(): Promise<DurableInstanceSummary[]> {
+    const now = Date.now()
+    if (this.activeCache && now - this.activeCache.at < ACTIVE_SUMMARIES_TTL_MS) {
+      return this.activeCache.promise
+    }
+    const promise = this.loadActiveSummaries().catch((error: unknown) => {
+      this.activeCache = undefined // never cache a failure
+      throw error
+    })
+    this.activeCache = { at: now, promise }
+    return promise
+  }
+
+  private activeCache?: { at: number; promise: Promise<DurableInstanceSummary[]> }
+
+  private async loadActiveSummaries(): Promise<DurableInstanceSummary[]> {
     const runsPerQueue = await Promise.all(
       (await this.queueNames()).map((name) => this.queueFor(name).activeRuns()),
     )

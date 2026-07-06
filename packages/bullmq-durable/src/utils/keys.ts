@@ -140,6 +140,22 @@ export function terminalIndexKey(
 
 /** @deprecated Pre-per-queue global (cross-queue) active set — read + reaped
  *  during one transition window, never written. Removed in 0.3.0. */
+/**
+ * Keys whose existence signals durable state, for dashboards probing "is
+ * bullmq-durable in use?" without knowing the layout: `any` — one variadic
+ * `EXISTS` > 0 means durable data (or a registered worker) is present;
+ * `legacy` — the 0.1.x global-index subset, signalling a rolling-upgrade
+ * window (e.g. gate legacy-only scans on it). Removed keys: `legacy` shrinks
+ * to nothing in 0.3.0.
+ */
+export function durableProbeKeys(prefix: string): { any: string[]; legacy: string[] } {
+  const legacy = [
+    legacyActiveIndexKey(prefix),
+    ...TERMINAL_STATUSES.map((status) => legacyTerminalIndexKey(prefix, status)),
+  ]
+  return { any: [queuesRegistryKey(prefix), ...legacy], legacy }
+}
+
 export function legacyActiveIndexKey(prefix: string): string {
   return `${prefix}:idx:active`
 }

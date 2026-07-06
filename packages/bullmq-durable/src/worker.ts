@@ -80,10 +80,12 @@ export class DurableWorker {
       void this.settleOrphanedFailure(job, error)
     })
 
-    // Start-of-life pass: reconcile orphans left while no worker was running,
-    // then reap terminal state whose jobs were cleaned in the meantime.
+    // Start-of-life: announce this durable queue (so dashboards detect the
+    // deployment before the first run ever ticks), reconcile orphans left
+    // while no worker was running, then reap state whose jobs were cleaned.
     void this.bullWorker
       .waitUntilReady()
+      .then(() => this.store.registerQueue(queueName))
       .then(() => this.reaper.pass(true))
       .catch(() => undefined)
   }

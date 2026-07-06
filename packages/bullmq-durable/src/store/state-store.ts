@@ -144,6 +144,13 @@ export interface StateStore {
   // retained-job count, never with its neighbours'.
 
   /** Queue names that ever created durable state (cheap registry read). */
+  /**
+   * Announce a durable queue (idempotent). Called by `DurableWorker` at
+   * startup so dashboards can detect durable deployments BEFORE the first run
+   * ever ticks (runs also register their queue on creation).
+   */
+  registerQueue(queueName: string): Promise<void>
+
   queues(): Promise<string[]>
 
   /** A queue's non-terminal instance ids (bounded by its in-flight work). */

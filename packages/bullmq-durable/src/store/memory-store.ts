@@ -263,10 +263,16 @@ export class MemoryStateStore implements StateStore {
 
   // -- Reaper / admin primitives ---------------------------------------------
 
+  private readonly registeredQueues = new Set<string>()
+
   async queues(): Promise<string[]> {
-    const names = new Set<string>()
+    const names = new Set<string>(this.registeredQueues)
     for (const record of this.records.values()) names.add(record.instance.queueName)
     return [...names]
+  }
+
+  async registerQueue(queueName: string): Promise<void> {
+    this.registeredQueues.add(queueName)
   }
 
   async listActive(queueName: string): Promise<string[]> {

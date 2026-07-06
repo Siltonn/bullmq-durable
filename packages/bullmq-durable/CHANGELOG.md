@@ -97,6 +97,14 @@ own options — `attempts`, `backoff`, `priority`, `removeOnComplete`,
   ships alongside (`deriveView`, `classifyLocalStuck`, `synthesizeEvents`,
   `sleepWakeAt`, batch `summarizeInstances`) — `bullmq-cockpit` 0.2.0
   consumes exactly this API and no longer mirrors the protocol by hand.
+- **Deployment detection for dashboards**: `DurableWorker` announces its queue
+  in the `{prefix}:queues` registry at startup (idempotent
+  `StateStore.registerQueue`), so a durable deployment is detectable BEFORE
+  the first run ever ticks; `durableProbeKeys(prefix)` exports the marker keys
+  (current + 0.1.x legacy) so dashboards can probe with one variadic `EXISTS`
+  on their own client — no layout knowledge, no SCAN. `RedisStateStore` now
+  dials Redis lazily on first command (constructing a store — e.g. just to
+  probe — no longer costs a connection).
 - **NestJS: `DURABLE_QUEUE_NAMES`** — an exported injection token resolving to
   a lazy `() => string[]` of every queue registered through
   `DurableBullModule.registerQueue(Async)`. Wire it into dashboards (e.g.
