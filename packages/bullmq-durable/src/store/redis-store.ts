@@ -2,15 +2,22 @@
  * Redis-backed {@link StateStore} — the default, production implementation.
  *
  * Layout (see {@link import("../utils/keys")}):
- *  - `{prefix}:instance:{id}`  Hash   — instance fields
- *  - `{prefix}:steps:{id}`     Hash   — stepKey -> JSON(StepState)
- *  - `{prefix}:lock:{id}`      String — advisory instance lock
- *  - `{prefix}:idx:*`          Set/ZSets — status index (active + done buckets)
+ *  - `{prefix}:instance:{id}`              Hash   — instance fields
+ *  - `{prefix}:steps:{id}`                 Hash   — stepKey -> JSON(StepState)
+ *  - `{prefix}:lock:{id}`                  String — advisory instance lock
+ *  - `{prefix}:queues`                     Set    — queues that ever held durable state
+ *  - `{prefix}:idx:{queue}:active`         Set    — the queue's non-terminal instance ids
+ *  - `{prefix}:idx:{queue}:done:{status}`  ZSet   — the queue's terminal instance
+ *    ids, scored by the terminal-transition epoch-ms; one bucket per status in
+ *    TERMINAL_STATUSES (completed / failed / cancelled / compensation_failed)
+ *  - Legacy 0.1.x forms — the idx keys without the `{queue}` segment
+ *    (`{prefix}:idx:active`, `{prefix}:idx:done:{status}`) and the
+ *    `{prefix}:logs:{id}` lists — are read/reaped during a rolling upgrade,
+ *    never written; gone in 0.3.0
  *
  * State carries no TTL: a run's state lives exactly as long as its BullMQ job,
  * and the worker/queue layer reaps dead state through the reaper primitives
- * (`listActive` / `listOldestTerminal` / `removeInstances`). Done-bucket zsets
- * are scored by the terminal-transition timestamp (time-ordered).
+ * (`listActive` / `listOldestTerminal` / `removeInstances`).
  *
  * Durability depends entirely on how the underlying Redis is configured. See
  * the README's "Redis persistence" section before using this for
