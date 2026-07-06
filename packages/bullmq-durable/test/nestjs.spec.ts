@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { ConnectionOptions } from "bullmq"
 import {
   DURABLE_BULL_OPTIONS,
+  DURABLE_QUEUE_NAMES,
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,
   DURABLE_WORKER_FACTORY,
@@ -412,6 +413,30 @@ describe("DurableBullModule", () => {
     await moduleRef.init()
 
     expect(started).toContain("generation")
+
+    await moduleRef.close()
+  })
+
+  it("exposes registered queue names through DURABLE_QUEUE_NAMES (lazy thunk)", async () => {
+    const store = new MemoryStateStore()
+    const factory: DurableWorkerFactory = () =>
+      ({ close: async () => undefined }) as unknown as ReturnType<DurableWorkerFactory>
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        DurableBullModule.forRoot({ connection: CONNECTION, stateStore: store }),
+        DurableBullModule.registerQueue(
+          { name: "generation", processor: GenerationProcessor },
+          { name: "media" },
+        ),
+      ],
+      providers: [{ provide: DURABLE_WORKER_FACTORY, useValue: factory }],
+    }).compile()
+    await moduleRef.init()
+
+    // The token resolves to a thunk (dashboards read it lazily per request).
+    const names = moduleRef.get<() => string[]>(DURABLE_QUEUE_NAMES)
+    expect(names().sort()).toEqual(["generation", "media"])
 
     await moduleRef.close()
   })

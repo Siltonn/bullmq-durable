@@ -7,44 +7,86 @@ describe("retry policy", () => {
   it("resolves defaults and merges step over worker options", () => {
     expect(resolveRetry()).toEqual({
       attempts: 1,
-      backoff: "fixed",
+      type: "fixed",
       delayMs: 0,
+      jitter: 0,
       maxDelayMs: undefined,
     })
 
     const merged = resolveRetry(
       { attempts: 5 },
-      { attempts: 2, delay: "10s", backoff: "exponential" },
+      { attempts: 2, backoff: { type: "exponential", delay: "10s" } },
     )
     expect(merged).toEqual({
       attempts: 5,
-      backoff: "exponential",
+      type: "exponential",
       delayMs: 10_000,
+      jitter: 0,
       maxDelayMs: undefined,
     })
   })
 
+  it("accepts the BullMQ-shaped backoff forms", () => {
+    // A bare number/duration is a fixed delay, exactly like BullMQ's `backoff: 5000`.
+    expect(resolveRetry({ backoff: 5000 })).toMatchObject({ type: "fixed", delayMs: 5000 })
+    expect(resolveRetry({ backoff: "5s" })).toMatchObject({ type: "fixed", delayMs: 5000 })
+    // The object form mirrors BullMQ's BackoffOptions (plus maxDelay).
+    expect(
+      resolveRetry({ backoff: { type: "exponential", delay: 200, jitter: 0.5, maxDelay: "1m" } }),
+    ).toMatchObject({ type: "exponential", delayMs: 200, jitter: 0.5, maxDelayMs: 60_000 })
+  })
+
+  it("still accepts the deprecated 0.1.x flat shape, unchanged in behaviour", () => {
+    const legacy = resolveRetry({
+      attempts: 3,
+      backoff: "exponential",
+      delay: "10s",
+      maxDelay: "5m",
+    })
+    expect(legacy).toEqual({
+      attempts: 3,
+      type: "exponential",
+      delayMs: 10_000,
+      jitter: 0,
+      maxDelayMs: 300_000,
+    })
+  })
+
   it("computes fixed and exponential backoff", () => {
-    const fixed = resolveRetry({ attempts: 5, delay: "10s", backoff: "fixed" })
+    const fixed = resolveRetry({ attempts: 5, backoff: "10s" })
     expect(computeBackoff(fixed, 1)).toBe(10_000)
     expect(computeBackoff(fixed, 3)).toBe(10_000)
 
-    const exp = resolveRetry({ attempts: 5, delay: "1s", backoff: "exponential" })
+    const exp = resolveRetry({ attempts: 5, backoff: { type: "exponential", delay: "1s" } })
     expect(computeBackoff(exp, 1)).toBe(1_000)
     expect(computeBackoff(exp, 2)).toBe(2_000)
     expect(computeBackoff(exp, 3)).toBe(4_000)
 
     const capped = resolveRetry({
       attempts: 5,
-      delay: "1s",
-      backoff: "exponential",
-      maxDelay: "3s",
+      backoff: { type: "exponential", delay: "1s", maxDelay: "3s" },
     })
     expect(computeBackoff(capped, 3)).toBe(3_000) // 4s capped to 3s
   })
 
+  it("spreads jittered delays over [base*(1-jitter), base), like BullMQ", () => {
+    const jittered = resolveRetry({ backoff: { type: "fixed", delay: 1000, jitter: 0.5 } })
+    for (let i = 0; i < 50; i++) {
+      const delay = computeBackoff(jittered, 1)
+      expect(delay).toBeGreaterThanOrEqual(500)
+      expect(delay).toBeLessThan(1000)
+    }
+    // Jitter never exceeds maxDelay: the cap applies BEFORE randomisation.
+    const cappedJitter = resolveRetry({
+      backoff: { type: "exponential", delay: "1s", jitter: 0.5, maxDelay: "2s" },
+    })
+    for (let i = 0; i < 50; i++) {
+      expect(computeBackoff(cappedJitter, 5)).toBeLessThanOrEqual(2_000)
+    }
+  })
+
   it("caps exponential backoff at a default ceiling when no maxDelay is set", () => {
-    const exp = resolveRetry({ attempts: 100, delay: "1s", backoff: "exponential" })
+    const exp = resolveRetry({ attempts: 100, backoff: { type: "exponential", delay: "1s" } })
     // Without a cap, 1s * 2**79 would overflow toward Infinity.
     const delay = computeBackoff(exp, 80)
     expect(Number.isFinite(delay)).toBe(true)
@@ -178,8 +220,8 @@ describe("ctx.retryLater", () => {
       return "done"
     })
     await engine.start("job", {}, "1")
+    // "30" was NOT parsed as a 30ms delay — the configured 9s delay applied.
     expect(engine.peekPending()[0]?.delayMs).toBe(9_000)
-    expect(engine.peekPending()[0]?.reason).toContain("30")
   })
 
   it("treats a unit-qualified single argument as a delay", async () => {
@@ -202,7 +244,6 @@ describe("ctx.retryLater", () => {
     })
     await engine.start("job", {}, "1")
     expect(engine.peekPending()[0]?.delayMs).toBe(20_000)
-    expect(engine.peekPending()[0]?.reason).toContain("provider pending")
   })
 
   it("does not record an error on the step while retrying", async () => {

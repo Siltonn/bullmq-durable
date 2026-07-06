@@ -1,11 +1,15 @@
 /**
  * HealthInspector — connection health plus durable "stuck" detection.
  *
- * The four stuck classes (see RFC §20) split across the two data sources:
+ * The stuck classes split across the two data sources:
  *  - `running_stale` / `resume_missed` are derivable from durable state alone
  *    (computed in {@link DurableInspector} and surfaced on each summary).
- *  - `orphan_resume_job` needs a peek at BullMQ's pending jobs.
- *  - `orphan_instance` needs to confirm a yielded instance still has a tick.
+ *  - `orphan_instance` correlates with BullMQ: a non-terminal instance is
+ *    healthy iff its (single) job still exists in a live state. A missing job
+ *    means it was hand-deleted under the runtime; a `failed` job under a
+ *    non-terminal instance means stall settlement died mid-way.
+ *  - `orphan_resume_job` is the legacy (0.1.x rolling-upgrade) check for
+ *    envelope resume ticks pointing at missing instances. Removed in 0.3.0.
  *
  * Stuck detection is an on-demand endpoint, so the BullMQ scans here are bounded
  * by a cap rather than streaming the whole keyspace.
@@ -14,7 +18,7 @@
 import type { Queue } from "bullmq"
 import type { Redis } from "ioredis"
 import type { Health, StuckInstance, StuckKind, StuckReport } from "../../shared/dto"
-import { DURABLE_META_KEY, isResumeEnvelope, resumeJobId } from "../durable/protocol"
+import { DURABLE_META_KEY, isResumeEnvelope } from "bullmq-durable"
 import type { BullMQInspector } from "./bullmq"
 import type { DurableInspector } from "./durable-inspector"
 
@@ -25,7 +29,10 @@ export interface HealthInspectorDeps {
   redis: Redis
   bullmq: BullMQInspector
   durable?: DurableInspector
-  durableEnabled: boolean
+  /** Live "is durable in use?" (explicit setting, or the auto probe). */
+  detectDurable: () => Promise<boolean>
+  /** Whether 0.1.x legacy markers are present (gates the orphan-resume scan). */
+  legacyDurablePresent: () => Promise<boolean>
   stuckThresholdMs: number
   getQueue: (name: string) => Queue
 }
@@ -34,7 +41,8 @@ export class HealthInspector {
   private readonly redis: Redis
   private readonly bullmq: BullMQInspector
   private readonly durable?: DurableInspector
-  private readonly durableEnabled: boolean
+  private readonly detectDurable: () => Promise<boolean>
+  private readonly legacyDurablePresent: () => Promise<boolean>
   private readonly defaultThresholdMs: number
   private readonly getQueue: (name: string) => Queue
 
@@ -42,7 +50,8 @@ export class HealthInspector {
     this.redis = deps.redis
     this.bullmq = deps.bullmq
     this.durable = deps.durable
-    this.durableEnabled = deps.durableEnabled
+    this.detectDurable = deps.detectDurable
+    this.legacyDurablePresent = deps.legacyDurablePresent
     this.defaultThresholdMs = deps.stuckThresholdMs
     this.getQueue = deps.getQueue
   }
@@ -69,7 +78,7 @@ export class HealthInspector {
 
     return {
       redis: { ok: redisOk, latencyMs, error },
-      durableEnabled: this.durableEnabled,
+      durableEnabled: await this.detectDurable(),
       queues,
       generatedAt: Date.now(),
     }
@@ -79,7 +88,7 @@ export class HealthInspector {
     const threshold = thresholdMs ?? this.defaultThresholdMs
     const found: StuckInstance[] = []
 
-    if (this.durable) {
+    if (this.durable && (await this.detectDurable())) {
       // Every "stuck" kind is a non-terminal condition (running_stale /
       // resume_missed / orphan_instance), so the bounded active set is sufficient
       // — no full scan.
@@ -104,17 +113,30 @@ export class HealthInspector {
         }
       }
 
-      // orphan_instance: a yielded instance whose latest resume tick is gone.
-      const yielded = summaries.filter((s) => s.status === "yielded" && s.resumeSeq > 0)
+      // orphan_instance: a non-terminal instance whose (single) job is gone or
+      // terminally failed. One run = one job, so job state is the health truth:
+      //  - missing job → hand-deleted / bulk-cleaned under the runtime;
+      //  - failed job  → stall settlement died before finishing (retry it).
+      const yielded = summaries.filter((s) => s.status === "yielded")
       for (const s of yielded.slice(0, SCAN_CAP)) {
-        const expectedId = resumeJobId(s.originalJobId, s.resumeSeq)
-        const job = await this.getQueue(s.queueName)
-          .getJob(expectedId)
-          .catch(() => undefined)
-        if (!job) {
+        // Carrier resolution (incl. the 0.1.x legacy fallback) lives in the
+        // runtime package — one source of truth for "which job carries a run".
+        const state = await this.durable.carrierState(s.queueName, s.originalJobId)
+        const healthy =
+          state === "delayed" ||
+          state === "waiting" ||
+          state === "prioritized" ||
+          state === "active" ||
+          state === "waiting-children"
+        if (!healthy) {
           found.push({
             kind: "orphan_instance",
-            detail: `Yielded instance has no pending resume job (${expectedId})`,
+            detail:
+              state === "missing"
+                ? `Instance's job "${s.originalJobId}" no longer exists (removed outside the runtime)`
+                : state === "failed"
+                  ? `Instance's job failed but settlement never finished — retry it from the dashboard`
+                  : `Instance's job "${s.originalJobId}" is in unexpected state "${state}"`,
             instanceId: s.id,
             queueName: s.queueName,
             jobName: s.jobName,
@@ -125,12 +147,16 @@ export class HealthInspector {
         }
       }
 
-      // orphan_resume_job: a pending resume job whose instance no longer EXISTS (a
-      // tick pointing at a *terminal* instance is not flagged — the runtime no-ops
-      // it and removeOnComplete clears it, so it self-heals rather than sticks).
-      const queueNames = await this.bullmq.queueNames().catch(() => [])
-      for (const name of queueNames) {
-        found.push(...(await this.findOrphanResumeJobs(name)))
+      // orphan_resume_job (LEGACY, 0.1.x rolling-upgrade window): a pending
+      // envelope resume job whose instance no longer EXISTS. Removed in 0.3.0.
+      // This is the ONE scan that hydrates real jobs per queue — gated behind
+      // the legacy-marker probe so it costs nothing once (or if) no 0.1.x
+      // data exists: the display layer must never tax a clean deployment.
+      if (await this.legacyDurablePresent()) {
+        const queueNames = await this.bullmq.queueNames().catch(() => [])
+        for (const name of queueNames) {
+          found.push(...(await this.findOrphanResumeJobs(name)))
+        }
       }
     }
 

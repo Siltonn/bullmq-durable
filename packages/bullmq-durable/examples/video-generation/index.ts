@@ -20,7 +20,19 @@ interface VideoAsset {
 
 const connection = { host: "127.0.0.1", port: 6379 }
 
-export const queue = new DurableQueue<CreateVideoInput, VideoAsset>("generation", { connection })
+export const queue = new DurableQueue<CreateVideoInput, VideoAsset>("generation", {
+  connection,
+  // One run = one job: BullMQ's own cleanup governs the whole run record.
+  defaultJobOptions: {
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+    keepLogs: 1000,
+    // Non-step errors (e.g. a crash between steps) get BullMQ-native retries;
+    // step errors are governed by each step's own `retry` budget.
+    attempts: 3,
+    backoff: { type: "exponential", delay: 5_000 },
+  },
+})
 
 export const worker = new DurableWorker(
   "generation",
@@ -32,7 +44,7 @@ export const worker = new DurableWorker(
 
       const result = await ctx.step(
         "poll-provider-task",
-        { retry: { attempts: 60, delay: "10s" } },
+        { retry: { attempts: 60, backoff: "10s" } },
         async () => {
           const status = await provider.getTask(task.id)
 
@@ -65,8 +77,6 @@ export const worker = new DurableWorker(
   {
     connection,
     concurrency: 10,
-    lockTimeout: "5m",
-    retention: { completed: "7d", failed: "30d" },
   },
 )
 

@@ -53,15 +53,20 @@ export function createQueueInspector(deps: BullMQInspectorDeps) {
     async resumeQueue(name: string): Promise<void> {
       await getQueue(name).resume()
     },
+    // Drain/clean route through the durable layer when it is enabled: a bare
+    // bulk removal strands the removed jobs' run state (phantom active runs
+    // until a worker restart); the durable variants delete/reap it in the
+    // same action.
     async drainQueue(name: string): Promise<void> {
-      await getQueue(name).drain()
+      if (durable) await durable.drainQueue(name)
+      else await getQueue(name).drain()
     },
     async cleanQueue(name: string, options: CleanOptions): Promise<void> {
-      await getQueue(name).clean(
-        options.graceMs ?? 0,
-        options.limit ?? 1000,
-        options.status ?? "completed",
-      )
+      const graceMs = options.graceMs ?? 0
+      const limit = options.limit ?? 1000
+      const status = options.status ?? "completed"
+      if (durable) await durable.cleanQueue(name, graceMs, limit, status)
+      else await getQueue(name).clean(graceMs, limit, status)
     },
   }
 }

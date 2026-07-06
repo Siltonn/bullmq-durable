@@ -4,22 +4,31 @@
  *   import { BullMQCockpitModule } from "bullmq-cockpit/nestjs"
  *
  *   @Module({
- *     imports: [BullMQCockpitModule.register({ path: "/admin/bullmq", connection })],
+ *     imports: [BullMQCockpitModule.forRoot({ path: "/admin/bullmq", connection })],
  *   })
  *   export class AdminModule {}
  *
- *   // …or source connection / auth from DI:
+ *   // …or source connection / auth / queue names from DI:
  *   @Module({
  *     imports: [
- *       BullMQCockpitModule.registerAsync({
+ *       BullMQCockpitModule.forRootAsync({
  *         path: "/admin/bullmq",
  *         imports: [ConfigModule],
  *         inject: [ConfigService],
- *         useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+ *         useFactory: (config: ConfigService) => ({
+ *           connection: config.get("redis"),
+ *           // `queues` also takes a thunk — merged with `registerQueue` names,
+ *           // read lazily per request. Wire any source: config, or
+ *           // bullmq-durable's DURABLE_QUEUE_NAMES for zero double-registration.
+ *           queues: () => config.get("queueNames"),
+ *         }),
  *       }),
  *     ],
  *   })
  *   export class AdminModule {}
+ *
+ * (`register` / `registerAsync` remain as aliases of `forRoot` / `forRootAsync`
+ * — the canonical names follow the `BullModule.forRoot` convention.)
  *
  * It depends only on `@nestjs/common` (an optional peer); the cockpit core never
  * imports Nest. The cockpit is mounted as Nest middleware, which runs on **both**
@@ -123,11 +132,13 @@ const COCKPIT_RESOLVED = Symbol("BULLMQ_COCKPIT_RESOLVED")
 export class BullMQCockpitModule implements NestModule, OnApplicationShutdown {
   constructor(@Inject(COCKPIT_RESOLVED) private readonly resolved: ResolvedModule) {}
 
-  static register(options: BullMQCockpitModuleOptions): DynamicModule {
+  /** Configure the dashboard (canonical name, mirroring `BullModule.forRoot`). */
+  static forRoot(options: BullMQCockpitModuleOptions): DynamicModule {
     return this.build([{ provide: COCKPIT_RAW_OPTIONS, useValue: options }])
   }
 
-  static registerAsync(options: BullMQCockpitModuleAsyncOptions): DynamicModule {
+  /** Like {@link forRoot}, but resolves the options from DI. */
+  static forRootAsync(options: BullMQCockpitModuleAsyncOptions): DynamicModule {
     return this.build(
       [
         {
@@ -141,6 +152,16 @@ export class BullMQCockpitModule implements NestModule, OnApplicationShutdown {
       ],
       options.imports,
     )
+  }
+
+  /** Alias of {@link forRoot} (kept from 0.1.x). */
+  static register(options: BullMQCockpitModuleOptions): DynamicModule {
+    return this.forRoot(options)
+  }
+
+  /** Alias of {@link forRootAsync} (kept from 0.1.x). */
+  static registerAsync(options: BullMQCockpitModuleAsyncOptions): DynamicModule {
+    return this.forRootAsync(options)
   }
 
   /**
@@ -189,15 +210,20 @@ export class BullMQCockpitModule implements NestModule, OnApplicationShutdown {
             raw: BullMQCockpitModuleOptions,
             registry: CockpitQueueRegistry,
           ): ResolvedModule => {
-            // Seed the registry with any queues passed at the root, then hand the
-            // cockpit a live view of it — read per request, so queues registered
-            // by feature modules are picked up and Redis is never scanned.
+            // Seed the registry with any queue ARRAY passed at the root; a
+            // queues THUNK stays live and is merged on every read. The cockpit
+            // reads per request, so names from feature-module `registerQueue`
+            // calls and from the thunk's source (a ConfigService, durable's
+            // DURABLE_QUEUE_NAMES, …) are picked up — Redis is never scanned.
             if (Array.isArray(raw.queues)) registry.add(...raw.queues)
+            const userQueues = typeof raw.queues === "function" ? raw.queues : undefined
             const path = normalizeBasePath(raw.path ?? "/admin/bullmq")
             const cockpit = createCockpitApp({
               ...raw,
               basePath: path,
-              queues: () => registry.all(),
+              queues: userQueues
+                ? () => [...new Set([...userQueues(), ...registry.all()])]
+                : () => registry.all(),
             })
             return { cockpit, path }
           },

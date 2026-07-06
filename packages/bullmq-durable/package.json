@@ -1,10 +1,17 @@
 {
   "name": "bullmq-durable",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Durable execution for BullMQ jobs. Checkpoint, retry, sleep, and resume long-running jobs with a simple step API.",
   "type": "module",
   "license": "MIT",
   "author": "elmer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Siltonn/bullmq-durable.git",
+    "directory": "packages/bullmq-durable"
+  },
+  "homepage": "https://github.com/Siltonn/bullmq-durable/tree/main/packages/bullmq-durable#readme",
+  "bugs": "https://github.com/Siltonn/bullmq-durable/issues",
   "packageManager": "pnpm@11.3.0",
   "keywords": [
     "bullmq",

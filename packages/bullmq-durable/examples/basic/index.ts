@@ -21,7 +21,16 @@ interface SendEmailResult {
 const connection = { host: "127.0.0.1", port: 6379 }
 
 // The queue is typed by its payload — no name->payload map to declare.
-export const queue = new DurableQueue<SendEmailInput, SendEmailResult>("emails", { connection })
+// The run's whole record (state + logs) lives exactly as long as its job, so
+// BullMQ's own cleanup options govern retention; keepLogs bounds ctx.log.
+export const queue = new DurableQueue<SendEmailInput, SendEmailResult>("emails", {
+  connection,
+  defaultJobOptions: {
+    removeOnComplete: { age: 7 * 24 * 3600 }, // keep finished runs for 7d
+    removeOnFail: { age: 30 * 24 * 3600 }, // keep failed runs for 30d
+    keepLogs: 1000,
+  },
+})
 
 export const worker = new DurableWorker(
   "emails",
@@ -39,10 +48,7 @@ export const worker = new DurableWorker(
       return { sent: true }
     },
   },
-  {
-    connection,
-    retention: { completed: "7d", failed: "30d" },
-  },
+  { connection },
 )
 
 export async function enqueue(): Promise<void> {

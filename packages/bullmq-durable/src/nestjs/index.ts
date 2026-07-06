@@ -5,12 +5,13 @@
  * declared as optional peer dependencies. The core package never imports it.
  */
 
-export { DurableBullModule } from "./module"
+export { DurableBullModule, DurableQueueNamesRegistry } from "./module"
 export { DurableFailure, DurableProcess, DurableProcessor } from "./decorators"
 export { getDurableQueueToken, InjectDurableQueue } from "./injector"
 export { DurableExplorer } from "./explorer"
 export {
   DURABLE_BULL_OPTIONS,
+  DURABLE_QUEUE_NAMES,
   DURABLE_FAILURE_METADATA,
   DURABLE_PROCESS_METADATA,
   DURABLE_PROCESSOR_METADATA,

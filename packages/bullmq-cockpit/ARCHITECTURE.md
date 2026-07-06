@@ -109,7 +109,7 @@ src/
       routers/                 one file per domain (config/overview/queues/jobs/…): thin —
                                parse input → call an inspector → return (no business logic)
     infra/                     redis.ts · util/preview.ts (low-level helpers)
-    durable/                   protocol.ts · derive.ts (durable Redis protocol, mirrored)
+    durable/                   derive.ts (DTO projection over bullmq-durable's types; protocol.ts removed in 0.2.0 — superseded by the runtime's DurableQueue/DurableRun API)
     inspectors/
       bullmq/                  ← split of the old 966-line bullmq-inspector
         queue-inspector.ts     queues: names/summary/detail · pause/resume/drain/clean · counts · workers

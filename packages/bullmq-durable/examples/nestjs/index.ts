@@ -63,7 +63,12 @@ export class GenerationService {
     DurableBullModule.forRoot({ connection }),
     DurableBullModule.registerQueue({
       name: "generation",
-      retention: { completed: "7d", failed: "30d" },
+      // One run = one job: BullMQ's own cleanup options govern the run record.
+      defaultJobOptions: {
+        removeOnComplete: { age: 7 * 24 * 3600 },
+        removeOnFail: { age: 30 * 24 * 3600 },
+        keepLogs: 1000,
+      },
       // Listing the processor here auto-registers it — no separate `providers` entry.
       processor: GenerationProcessor,
     }),
@@ -71,6 +76,17 @@ export class GenerationService {
   providers: [GenerationService],
 })
 export class GenerationModule {}
+
+// --- Dashboard --------------------------------------------------------------
+// Mounting bullmq-cockpit in the same app? Inject DURABLE_QUEUE_NAMES so the
+// dashboard shows exactly the queues registered above — no second list:
+//
+//   BullMQCockpitModule.forRootAsync({
+//     inject: [DURABLE_QUEUE_NAMES],
+//     useFactory: (names: () => string[]) => ({ connection, queues: names }),
+//   })
+//
+// (Full example: bullmq-cockpit/examples/nestjs.)
 
 // --- Fake helpers (replace with real ones) ----------------------------------
 

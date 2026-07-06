@@ -11,6 +11,15 @@ export const DURABLE_STATE_STORE = Symbol("DURABLE_STATE_STORE")
 /** Optional injection token overriding how workers are constructed (tests). */
 export const DURABLE_WORKER_FACTORY = Symbol("DURABLE_WORKER_FACTORY")
 
+/**
+ * Injection token resolving to `() => string[]`: the names of every queue
+ * registered through `DurableBullModule.registerQueue(Async)`, read lazily.
+ * Wire it into dashboards — e.g. `BullMQCockpitModule.forRootAsync({ inject:
+ * [DURABLE_QUEUE_NAMES], useFactory: (names) => ({ ..., queues: names }) })` —
+ * so durable-registered queues appear without a second registration.
+ */
+export const DURABLE_QUEUE_NAMES = Symbol("DURABLE_QUEUE_NAMES")
+
 /** Metadata key set by `@DurableProcessor()` on a class. */
 export const DURABLE_PROCESSOR_METADATA = Symbol("DURABLE_PROCESSOR")
 

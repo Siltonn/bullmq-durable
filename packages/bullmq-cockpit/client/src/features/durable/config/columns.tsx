@@ -51,7 +51,7 @@ export function useDurableColumns(
       if (
         await confirm({
           title: "Resume now?",
-          body: `Enqueue a resume tick for "${inst.id}".`,
+          body: `Re-deliver the job for "${inst.id}" now (promotes it if delayed, revives it if missing).`,
           confirmLabel: "Resume",
           confirmColor: "primary",
         })

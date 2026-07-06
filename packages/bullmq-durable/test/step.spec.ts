@@ -135,3 +135,88 @@ describe("ctx.step", () => {
     expect(steps.every((s) => s.status === "completed")).toBe(true)
   })
 })
+
+describe("concurrent steps (Promise.all)", () => {
+  it("waits for detached siblings to settle before the tick finalises", async () => {
+    const done: string[] = []
+    let resolveSlow: (() => void) | undefined
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      await Promise.all([
+        // Yields immediately (sleep) — unwinds Promise.all on the first tick.
+        ctx.sleep("wait", "10s"),
+        // Keeps running detached until we let it finish.
+        ctx.step("slow", async () => {
+          await new Promise<void>((resolve) => {
+            resolveSlow = () => resolve()
+          })
+          done.push("slow")
+          return "slow-done"
+        }),
+      ])
+      return "done"
+    })
+
+    const first = engine.start("job", {}, "1")
+    // Let the tick reach the yield, then release the sibling: the tick must not
+    // finalise (suspend) until the sibling settled and its write landed.
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(resolveSlow).toBeDefined()
+    resolveSlow!()
+    const outcome = await first
+
+    expect(outcome.type).toBe("suspended")
+    expect(done).toEqual(["slow"]) // sibling finished BEFORE the tick returned
+    const slow = await engine.store.getStep(engine.instanceId("1"), "slow")
+    expect(slow?.status).toBe("completed") // its checkpoint landed inside the tick
+
+    const { last } = await engine.drain()
+    expect(last?.type).toBe("completed")
+  })
+
+  it("attributes ctx.log to the right step across concurrent steps", async () => {
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      await Promise.all([
+        ctx.step("alpha", async () => {
+          await ctx.log("from alpha")
+          return 1
+        }),
+        ctx.step("beta", async () => {
+          await ctx.log("from beta")
+          return 2
+        }),
+      ])
+      return "done"
+    })
+    await engine.run("job", {}, "1")
+
+    const { parseLogLine } = await import("../src/utils/log")
+    const entries = engine.jobLogs.map(parseLogLine)
+    expect(entries.find((e) => e.message === "from alpha")?.step).toBe("alpha")
+    expect(entries.find((e) => e.message === "from beta")?.step).toBe("beta")
+  })
+
+  it("honours a persisted retry backoff on early re-delivery (no premature attempt)", async () => {
+    let attempts = 0
+    const engine = new TestEngine(async (_job: DurableJob, ctx: DurableContext) => {
+      await ctx.step("flaky", { retry: { attempts: 3, backoff: "60s" } }, async () => {
+        attempts++
+        if (attempts < 2) throw new Error("transient")
+        return "ok"
+      })
+      return "done"
+    })
+
+    await engine.start("job", {}, "1") // attempt 1 fails, backoff 60s persisted
+    expect(attempts).toBe(1)
+
+    // Early re-delivery (stall takeover / promote) BEFORE the backoff elapsed:
+    // the attempt must NOT run early — the run re-parks for the remainder.
+    const early = await engine.deliverNow("1")
+    expect(early.type).toBe("suspended")
+    expect(attempts).toBe(1)
+
+    const { last } = await engine.drain() // time passes to nextRunAt
+    expect(attempts).toBe(2)
+    expect(last?.type).toBe("completed")
+  })
+})

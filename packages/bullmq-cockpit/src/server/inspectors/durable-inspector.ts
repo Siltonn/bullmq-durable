@@ -1,19 +1,24 @@
 /**
- * DurableInspector — reads and acts on `bullmq-durable` instance state.
+ * DurableInspector — the cockpit's thin adapter over `bullmq-durable`'s public
+ * object model: one {@link DurableQueue} per queue (reusing the cockpit's
+ * BullMQ `Queue` instances and one shared state store), {@link DurableRun}
+ * handles for run-scoped reads and actions.
  *
- * It talks to Redis directly through the documented durable protocol (see
- * `../durable/protocol.ts`); the runtime itself is never imported. Mutating
- * actions (resume / retry / cancel / delete) write through the *same* protocol,
- * so the cockpit behaves as a well-behaved peer of the runtime:
- *
- *  - **Resume** allocates a fresh `resumeSeq` (so the resume job id is unique)
- *    and enqueues a zero-delay tick. Replays are idempotent, so this is safe.
- *  - **Retry** lifts a failed instance off its terminal status so the next tick
- *    re-executes the failed step (completed steps stay cached).
- *  - **Cancel** flags the instance and best-effort removes the pending tick.
- *  - **Delete** drops durable state only — never business data or BullMQ jobs.
+ * Since 0.2.0 the runtime package exposes every read and action the dashboard
+ * needs (list windows, summaries, logs/events, resume/retry/cancel/delete with
+ * the legacy-carrier fallback built in). This class only does what is
+ * genuinely dashboard-shaped: cross-queue aggregation, wire-DTO projection,
+ * list filtering/sorting/pagination, and HTTP error mapping. No Redis-layout
+ * knowledge lives here.
  */
 
+import {
+  DurableActionError,
+  DurableQueue,
+  RedisStateStore,
+  summarizeInstances,
+} from "bullmq-durable"
+import type { DurableCarrierState, DurableRun, InstanceState } from "bullmq-durable"
 import type { Queue } from "bullmq"
 import type { Redis } from "ioredis"
 import type {
@@ -25,27 +30,8 @@ import type {
   DurableStatusCounts,
   DurableStep,
 } from "../../shared/dto"
-import { synthesizeEvents, toInstanceDetail, toStep } from "../durable/derive"
-import {
-  activeIndexKey,
-  DEFAULT_RETENTION_MS,
-  DURABLE_META_KEY,
-  instanceKey,
-  logsKey,
-  lockKey,
-  parseInstanceHash,
-  parseLog,
-  parseStep,
-  resumeJobId,
-  stepsKey,
-  terminalIndexKey,
-  type StoredInstanceState,
-  type StoredStepState,
-  type TerminalStatus,
-} from "../durable/protocol"
+import { toInstanceDetail, toInstanceSummary, toStep } from "../durable/derive"
 import { badRequest, notFound } from "../http/http-error"
-
-const MAX_COCKPIT_LOGS = 1000
 
 export interface DurableInstanceQuery {
   status?: string
@@ -66,15 +52,15 @@ export interface DurableInspectorDeps {
   getQueue: (name: string) => Queue
 }
 
-/** Statuses whose derived view depends on their steps. */
-const STEP_HUNGRY = new Set(["running", "yielded", "compensating", "failed", "compensation_failed"])
-
-/** The terminal statuses, in their fixed index-bucket order. */
+/** The terminal statuses, as `listRuns` kinds. */
 const TERMINAL_STATUSES = ["completed", "failed", "compensation_failed", "cancelled"] as const
 
-/** Max ids loaded per terminal bucket when listing. Pagination beyond this
- *  window is reported as `truncated` — the list never falls back to a full scan. */
+/** Max ids loaded per terminal bucket per queue when listing. Pagination beyond
+ *  this window is reported as `truncated` — the list never falls back to a scan. */
 const LIST_HARD_CAP = 2000
+
+/** Single-flight window for the active-population summary (overview + health). */
+const ACTIVE_SUMMARIES_TTL_MS = 2_000
 
 /** A zeroed count histogram, spread into every {@link DurableStatusCounts}. */
 const EMPTY_COUNTS = {
@@ -92,44 +78,100 @@ const EMPTY_COUNTS = {
 } as const
 
 export class DurableInspector {
-  private readonly redis: Redis
-  private readonly prefix: string
-  private readonly thresholdMs: number
+  /** One shared store for every queue's durable state (one Redis client). */
+  private readonly store: RedisStateStore
   private readonly getQueue: (name: string) => Queue
+  private readonly durableQueues = new Map<string, DurableQueue>()
+  private readonly thresholdMs: number
 
   constructor(deps: DurableInspectorDeps) {
-    this.redis = deps.redis
-    this.prefix = deps.prefix
     this.thresholdMs = deps.stuckThresholdMs
     this.getQueue = deps.getQueue
+    // RedisStateStore duplicates the client so scans never contend.
+    this.store = new RedisStateStore({ connection: deps.redis, prefix: deps.prefix })
+  }
+
+  async close(): Promise<void> {
+    // The queues hold only injected resources (the cockpit's bull queues + our
+    // shared store); closing them is a formality, the store is ours to close.
+    await Promise.allSettled([...this.durableQueues.values()].map((q) => q.close()))
+    this.durableQueues.clear()
+    await this.store.close()
+  }
+
+  // -- Object-model access ----------------------------------------------------
+
+  /** The durable view of one queue, reusing the cockpit's bull `Queue`. */
+  private queueFor(name: string): DurableQueue {
+    let queue = this.durableQueues.get(name)
+    if (!queue) {
+      queue = new DurableQueue(name, {
+        connection: {} as never, // never dialed: both store and bullmq are injected
+        stateStore: this.store,
+        bullmq: this.getQueue(name),
+      })
+      this.durableQueues.set(name, queue)
+    }
+    return queue
+  }
+
+  /** Every queue in the durable registry. */
+  private async queueNames(): Promise<string[]> {
+    return this.store.queues()
+  }
+
+  /**
+   * Resolve an instance id to its run handle WITHOUT parsing the id (ids are
+   * opaque): the instance state names its queue and job.
+   */
+  private async resolveRun(instanceId: string): Promise<DurableRun | null> {
+    const state = await this.store.getInstance(instanceId)
+    if (!state) return null
+    return this.queueFor(state.queueName).run(state.originalJobId, state)
+  }
+
+  /** The carrier job's BullMQ state for a run (health checks). */
+  async carrierState(queueName: string, jobId: string): Promise<DurableCarrierState> {
+    return this.queueFor(queueName).run(jobId).carrierState()
   }
 
   // -- Reads ---------------------------------------------------------------
 
   /**
-   * List instances WITHOUT a full scan: load candidate ids from the index (the
-   * bounded active set for non-terminal / stuck filters; the relevant terminal
-   * bucket(s) via `ZREVRANGE` for finished ones), hydrate only those, then
-   * filter / sort / paginate in memory. Deep pagination past the load window is
-   * reported as `truncated` (recent instances only).
+   * List instances WITHOUT a full scan: each queue loads candidates from its
+   * status index (the bounded active population for non-terminal / stuck
+   * filters; the relevant terminal bucket(s), newest first, for finished
+   * ones), then this adapter filters / sorts / paginates in memory.
    */
   async listInstances(query: DurableInstanceQuery): Promise<DurableInstanceList> {
     const page = Math.max(1, query.page)
-    const { instances, truncated, indexTotal, windowed } = await this.loadListCandidates(
-      query,
-      page,
+    const status = query.status
+    const isTerminal = (TERMINAL_STATUSES as readonly string[]).includes(status ?? "")
+
+    // Terminal statuses get REAL pagination (zset offset pages), not a window.
+    if (isTerminal && !query.stuckOnly) {
+      return this.listTerminalInstances(status as (typeof TERMINAL_STATUSES)[number], query, page)
+    }
+
+    // Non-terminal / mixed listings read the (bounded) active population,
+    // optionally plus terminal windows for "all".
+    const kind = query.stuckOnly || (status && status !== "all") ? "active" : "all"
+    const window = Math.min(page * query.pageSize + query.pageSize, LIST_HARD_CAP)
+    const pages = await Promise.all(
+      (await this.queueNames()).map((name) => this.queueFor(name).listRuns({ kind, window })),
     )
-    let summaries = await this.summarizeInstances(instances)
+    const indexTotal = pages.reduce((sum, p) => sum + p.indexTotal, 0)
+    const truncated = pages.some((p) => p.truncated)
+    const windowed = pages.some((p) => p.windowed)
+
+    let summaries = await this.summarize(pages.flatMap((p) => p.runs))
     summaries = this.applyFilters(summaries, query)
     summaries = this.applySort(summaries, query)
 
-    // `total` must be the real cardinality so the client's page count is stable
-    // (not the loaded-window size, which would grow as you paginate). When a
-    // terminal bucket is windowed, the index ZCOUNT is the exact total — unless a
-    // secondary in-memory filter (search/queue/jobName) narrows it, where the true
-    // filtered total isn't knowable without a scan, so we report the loaded count
-    // and let `truncated` signal "recent only". Active-only queries load the whole
-    // set, so the filtered length is already exact.
+    // `total` must be the real cardinality so the client's page count is stable.
+    // When a terminal bucket is windowed, the index count is exact — unless a
+    // secondary in-memory filter narrows it, where only the loaded count is
+    // knowable and `truncated` signals "recent only".
     const narrowed = Boolean(query.search || query.queue || query.jobName)
     const total = windowed && !narrowed ? indexTotal : summaries.length
 
@@ -144,442 +186,268 @@ export class DurableInspector {
   }
 
   /**
-   * Load candidate instances for a list query from the index — never a scan. The
-   * status filter picks the sources: the bounded active set covers every
-   * non-terminal / stuck query; a terminal status reads only its bucket; "all"
-   * reads the active set plus every terminal bucket. Buckets are read newest-first
-   * up to a window that scales with the requested page (capped at
-   * {@link LIST_HARD_CAP}), so shallow pages stay cheap.
+   * Terminal-status listing via `listRunsPage` — the runtime's exact offset
+   * pages over one done bucket. With a single queue and the default recency
+   * sort the offset is pushed all the way down to Redis (exact deep
+   * pagination, no cap); across queues, exact per-queue pages are merged and
+   * sliced.
    */
-  private async loadListCandidates(
+  private async listTerminalInstances(
+    status: (typeof TERMINAL_STATUSES)[number],
     query: DurableInstanceQuery,
     page: number,
-  ): Promise<{
-    instances: StoredInstanceState[]
-    truncated: boolean
-    indexTotal: number
-    windowed: boolean
-  }> {
-    const status = query.status
-    const isTerminal =
-      status === "completed" ||
-      status === "failed" ||
-      status === "compensation_failed" ||
-      status === "cancelled"
-    let wantActive: boolean
-    let buckets: readonly TerminalStatus[]
-    if (query.stuckOnly) {
-      wantActive = true // "stuck" is always a non-terminal condition
-      buckets = []
-    } else if (isTerminal) {
-      wantActive = false
-      buckets = [status as TerminalStatus]
-    } else if (!status || status === "all") {
-      wantActive = true
-      buckets = TERMINAL_STATUSES
-    } else {
-      wantActive = true // a non-terminal derived status (running/sleeping/retrying/waiting)
-      buckets = []
+  ): Promise<DurableInstanceList> {
+    const names = query.queue ? [query.queue] : await this.queueNames()
+    if (names.length === 0) {
+      return { items: [], total: 0, page, pageSize: query.pageSize }
     }
 
-    // Enough of each bucket to cover the requested page after the merge, capped.
-    const window = Math.min(page * query.pageSize + query.pageSize, LIST_HARD_CAP)
-    const now = Date.now()
+    const recencySort = (query.sort ?? "updatedAt") === "updatedAt"
+    const pushdown = names.length === 1 && recencySort && !query.search && !query.jobName
+    if (pushdown) {
+      const result = await this.queueFor(names[0]!).listRunsPage({
+        kind: status,
+        offset: (page - 1) * query.pageSize,
+        limit: query.pageSize,
+        order: query.order ?? "desc",
+      })
+      return {
+        items: await this.summarize(result.runs),
+        total: result.total,
+        page,
+        pageSize: query.pageSize,
+      }
+    }
 
-    const pipe = this.redis.pipeline()
-    if (wantActive) pipe.smembers(activeIndexKey(this.prefix))
-    for (const st of buckets) {
-      const key = terminalIndexKey(this.prefix, st)
-      // Live ids only (score > now), newest-first, READ-ONLY — no prune-on-read.
-      pipe.zrevrangebyscore(key, "+inf", `(${now}`, "LIMIT", 0, window)
-      pipe.zcount(key, `(${now}`, "+inf") // live cardinality, for total + truncated
-    }
-    const res = (await pipe.exec()) ?? []
+    // Merge path: exact newest-first pages per queue, deep enough to cover the
+    // requested global slice, then filter/sort/slice in memory.
+    const need = Math.min(page * query.pageSize + query.pageSize, LIST_HARD_CAP)
+    const pages = await Promise.all(
+      names.map((name) =>
+        this.queueFor(name).listRunsPage({ kind: status, offset: 0, limit: need, order: "desc" }),
+      ),
+    )
+    let summaries = await this.summarize(pages.flatMap((p) => p.runs))
+    summaries = this.applyFilters(summaries, query)
+    summaries = this.applySort(summaries, query)
 
-    // Dedup across the active set and the done buckets: an id can briefly appear in
-    // both during a transition race, and would otherwise hydrate to a duplicate row.
-    const ids = new Set<string>()
-    let i = 0
-    let indexTotal = 0
-    if (wantActive) {
-      const activeIds = (res[i++]?.[1] as string[]) ?? []
-      for (const id of activeIds) ids.add(id)
-      indexTotal += activeIds.length // the whole active set is loaded → exact
-    }
-    let truncated = false
-    for (const _st of buckets) {
-      const bucketIds = (res[i++]?.[1] as string[]) ?? []
-      const live = Number(res[i++]?.[1] ?? 0)
-      for (const id of bucketIds) ids.add(id)
-      indexTotal += live
-      if (live > bucketIds.length) truncated = true // the bucket holds more than we loaded
-    }
+    const bucketTotal = pages.reduce((sum, p) => sum + p.total, 0)
+    const narrowed = Boolean(query.search || query.jobName)
+    const truncated = pages.some((p) => p.total > need)
+    const start = (page - 1) * query.pageSize
     return {
-      instances: await this.loadInstancesByIds([...ids]),
-      truncated,
-      indexTotal,
-      windowed: buckets.length > 0,
+      items: summaries.slice(start, start + query.pageSize),
+      total: narrowed ? summaries.length : bucketTotal,
+      page,
+      pageSize: query.pageSize,
+      ...(truncated ? { truncated: true } : {}),
     }
   }
 
-  /**
-   * Derived-status counts for the overview — read from the status index, never a
-   * scan. Terminal counts come straight from the index ZCARDs (after a lazy prune
-   * of retention-expired ids); the non-terminal breakdown is derived by hydrating
-   * the *bounded* active set. The runtime maintains the index from the first
-   * instance, so an empty index simply means no instances.
-   */
+  /** Derived-status counts for the overview — index reads only, never a scan. */
   async statusCounts(): Promise<DurableStatusCounts> {
-    const [completed, failed, compensationFailed, cancelled] = await this.terminalCounts()
-    const active = await this.activeSummaries()
+    const [countsPerQueue, active] = await Promise.all([
+      this.queueNames().then((names) =>
+        Promise.all(names.map((name) => this.queueFor(name).countRuns())),
+      ),
+      this.activeSummaries(),
+    ])
 
-    const counts: DurableStatusCounts = {
-      ...EMPTY_COUNTS,
-      completed,
-      failed,
-      compensation_failed: compensationFailed,
-      cancelled,
-      total: active.length + completed + failed + compensationFailed + cancelled,
+    const counts: DurableStatusCounts = { ...EMPTY_COUNTS }
+    for (const c of countsPerQueue) {
+      counts.completed += c.completed
+      counts.failed += c.failed
+      counts.compensation_failed += c.compensation_failed
+      counts.cancelled += c.cancelled
+      counts.total += c.completed + c.failed + c.compensation_failed + c.cancelled
     }
+    counts.total += active.length
     for (const s of active) {
-      // The active set is non-terminal, so this only bumps
-      // running/sleeping/retrying/waiting/compensating (terminal counts came from ZCARD).
+      // The active population is non-terminal, so this only bumps
+      // running/sleeping/retrying/waiting/compensating.
       counts[s.derivedStatus] += 1
       if (s.stuck) counts.stuck += 1
     }
     return counts
   }
 
-  /** Summarize already-loaded instances, fetching steps only for those whose
-   *  derived status needs them. Shared by the count and list paths. */
-  private async summarizeInstances(
-    instances: StoredInstanceState[],
-  ): Promise<DurableInstanceSummary[]> {
-    const now = Date.now()
-    const stepHungryIds = instances.filter((i) => STEP_HUNGRY.has(i.status)).map((i) => i.id)
-    const stepsById = await this.loadStepsFor(stepHungryIds)
-    // A `running` instance whose advisory lock is still held is a worker actively
-    // making progress on a long step — not stuck — even though the runtime only
-    // bumps `updatedAt` on transitions (so a long step looks "stale" by time alone).
-    // Check lock liveness to suppress that running_stale false-positive.
-    const runningIds = instances.filter((i) => i.status === "running").map((i) => i.id)
-    const locked = await this.lockedInstanceIds(runningIds)
-    return instances.map((instance) => {
-      const summary = this.summarize(instance, stepsById.get(instance.id) ?? [], now)
-      if (summary.stuck === "running_stale" && locked.has(instance.id)) {
-        return { ...summary, stuck: null }
-      }
-      return summary
-    })
-  }
-
-  /** Of the given instance ids, which currently hold a live advisory lock? */
-  private async lockedInstanceIds(ids: string[]): Promise<Set<string>> {
-    const held = new Set<string>()
-    if (ids.length === 0) return held
-    const pipe = this.redis.pipeline()
-    for (const id of ids) pipe.exists(lockKey(this.prefix, id))
-    const res = await pipe.exec()
-    res?.forEach(([, exists], index) => {
-      if (exists === 1) held.add(ids[index]!)
-    })
-    return held
-  }
-
-  /** Exact terminal counts, READ-ONLY: count only ids whose expiry score is still
-   *  in the future (`ZCOUNT '(now' '+inf'`). Retention-expired entries are excluded
-   *  by score even if not yet physically pruned, so the count is exact WITHOUT the
-   *  overview endpoint having to write (the runtime prunes on each terminal
-   *  transition). */
-  private async terminalCounts(): Promise<
-    [completed: number, failed: number, compensationFailed: number, cancelled: number]
-  > {
-    const now = Date.now()
-    const pipe = this.redis.pipeline()
-    for (const status of TERMINAL_STATUSES) {
-      pipe.zcount(terminalIndexKey(this.prefix, status), `(${now}`, "+inf")
-    }
-    const res = await pipe.exec()
-    const card = (i: number) => Number(res?.[i]?.[1] ?? 0)
-    // Order matches TERMINAL_STATUSES: completed, failed, compensation_failed, cancelled.
-    return [card(0), card(1), card(2), card(3)]
-  }
-
-  /** Hydrate + summarize the bounded active (non-terminal) set — no scan. Shared
-   *  by the overview counts and the health inspector's stuck/orphan detection
-   *  (every "stuck" kind is a non-terminal condition). */
+  /** Hydrate + summarize the bounded active (non-terminal) population. Shared
+   *  by the overview counts and the health inspector's stuck detection —
+   *  which poll on the same cycle, so a short single-flight cache halves the
+   *  Redis work without meaningful staleness on a dashboard. */
   async activeSummaries(): Promise<DurableInstanceSummary[]> {
-    const instances = await this.loadInstancesByIds(
-      await this.redis.smembers(activeIndexKey(this.prefix)),
-    )
-    // Defensive: an instance that has since gone terminal but lingers in the
-    // active set (a transition/backfill race) is not "active". Drop it from the
-    // tally and self-heal the index.
-    const live: StoredInstanceState[] = []
-    const stale: string[] = []
-    for (const i of instances) {
-      // running / yielded / compensating are all non-terminal — the runtime keeps
-      // them in the active set, so they are genuinely active (not stale).
-      if (i.status === "running" || i.status === "yielded" || i.status === "compensating") {
-        live.push(i)
-      } else {
-        stale.push(i.id)
-      }
+    const now = Date.now()
+    if (this.activeCache && now - this.activeCache.at < ACTIVE_SUMMARIES_TTL_MS) {
+      return this.activeCache.promise
     }
-    if (stale.length > 0) {
-      void this.redis.srem(activeIndexKey(this.prefix), ...stale).catch(() => {})
-    }
-    return this.summarizeInstances(live)
+    const promise = this.loadActiveSummaries().catch((error: unknown) => {
+      this.activeCache = undefined // never cache a failure
+      throw error
+    })
+    this.activeCache = { at: now, promise }
+    return promise
   }
 
-  /** Pipelined HGETALL of specific instance ids (no scan). */
-  private async loadInstancesByIds(ids: string[]): Promise<StoredInstanceState[]> {
-    if (ids.length === 0) return []
-    const pipeline = this.redis.pipeline()
-    for (const id of ids) pipeline.hgetall(instanceKey(this.prefix, id))
-    const results = await pipeline.exec()
-    const out: StoredInstanceState[] = []
-    results?.forEach(([err, hash], index) => {
-      if (err) return
-      const parsed = parseInstanceHash(hash as Record<string, string>)
-      if (parsed) out.push(parsed.id ? parsed : { ...parsed, id: ids[index]! })
+  private activeCache?: { at: number; promise: Promise<DurableInstanceSummary[]> }
+
+  private async loadActiveSummaries(): Promise<DurableInstanceSummary[]> {
+    const runsPerQueue = await Promise.all(
+      (await this.queueNames()).map((name) => this.queueFor(name).activeRuns()),
+    )
+    return this.summarize(runsPerQueue.flat())
+  }
+
+  /** Cross-queue batch summarize: one lock probe for the whole set. */
+  private async summarize(runs: DurableRun[]): Promise<DurableInstanceSummary[]> {
+    const instances = runs
+      .map((run) => run.snapshot)
+      .filter((state): state is InstanceState => Boolean(state))
+    const summaries = await summarizeInstances(this.store, instances, {
+      stuckThresholdMs: this.thresholdMs,
     })
-    return out
+    const now = Date.now()
+    return summaries.map((s) => ({
+      ...toInstanceSummary(s.instance, s.steps, now, this.thresholdMs),
+      // summarizeInstances already suppressed running_stale under a live lock.
+      stuck: s.stuck,
+    }))
   }
 
   async getInstance(instanceId: string): Promise<DurableInstanceDetail | null> {
-    const instance = await this.loadInstance(instanceId)
-    if (!instance) return null
-    const steps = await this.loadSteps(instanceId)
-    return toInstanceDetail(instance, steps, Date.now(), this.thresholdMs)
+    const run = await this.resolveRun(instanceId)
+    if (!run?.snapshot) return null
+    const steps = await run.steps()
+    return toInstanceDetail(run.snapshot, steps, Date.now(), this.thresholdMs)
   }
 
   async getSteps(instanceId: string): Promise<DurableStep[]> {
+    const run = await this.resolveRun(instanceId)
+    if (!run) return []
     const now = Date.now()
-    const steps = await this.loadSteps(instanceId)
-    return steps.map((s) => toStep(s, now))
+    return (await run.steps()).map((s) => toStep(s, now))
   }
 
   async getLogs(instanceId: string): Promise<DurableLogEntry[]> {
-    const raw = await this.redis.lrange(logsKey(this.prefix, instanceId), 0, -1)
-    return raw
-      .map(parseLog)
-      .filter((l): l is NonNullable<typeof l> => l !== null)
-      .map((l) => ({ message: l.message, meta: l.meta, timestamp: l.timestamp }))
+    const run = await this.resolveRun(instanceId)
+    return run ? run.logs() : []
   }
 
   async getEvents(instanceId: string): Promise<DurableEvent[]> {
-    const instance = await this.loadInstance(instanceId)
-    if (!instance) return []
-    const [steps, logs] = await Promise.all([
-      this.loadSteps(instanceId),
-      this.redis
-        .lrange(logsKey(this.prefix, instanceId), 0, -1)
-        .then((raw) => raw.map(parseLog).filter((l): l is NonNullable<typeof l> => l !== null)),
-    ])
-    return synthesizeEvents(instance, steps, logs)
+    const run = await this.resolveRun(instanceId)
+    return run ? run.events() : []
   }
 
-  /** Of the given instance ids, which actually exist? (pipelined EXISTS). */
+  /** Of the given instance ids, which actually exist? */
   async existing(instanceIds: string[]): Promise<Set<string>> {
     const found = new Set<string>()
-    if (instanceIds.length === 0) return found
-    const pipeline = this.redis.pipeline()
-    for (const id of instanceIds) pipeline.exists(instanceKey(this.prefix, id))
-    const results = await pipeline.exec()
-    results?.forEach(([, exists], index) => {
-      if (exists === 1) found.add(instanceIds[index]!)
+    const loaded = await this.store.getInstances(instanceIds)
+    loaded.forEach((instance, index) => {
+      if (instance) found.add(instanceIds[index]!)
     })
     return found
   }
 
-  // -- Actions -------------------------------------------------------------
+  // -- Actions (run methods + HTTP error mapping) ----------------------------
 
   async resumeNow(instanceId: string): Promise<void> {
-    const instance = await this.requireInstance(instanceId)
-    if (instance.status === "completed" || instance.status === "cancelled") {
-      throw badRequest(`Cannot resume a ${instance.status} instance`)
-    }
-    if (instance.status === "failed") {
-      throw badRequest("Use retry to re-run a failed instance")
-    }
-    if (instance.status === "compensation_failed") {
-      throw badRequest("Use retry compensation to re-drive a compensation_failed instance")
-    }
-    await this.enqueueResume(instance, 0)
-    await this.appendCockpitLog(instanceId, "Resume requested from cockpit", { action: "resume" })
+    await this.action(instanceId, (run) => run.resume())
   }
 
   async retry(instanceId: string): Promise<void> {
-    const instance = await this.requireInstance(instanceId)
-    if (instance.status !== "failed") {
-      throw badRequest("Retry only applies to failed instances")
-    }
-    // Reactivate: clear the error, restore `running`, move it back into the active
-    // set (out of every done bucket) and drop the retention TTL — a re-running
-    // instance must not expire. The failed step is left as-is: a replay re-runs any
-    // non-completed step, so it executes again naturally.
-    await this.reactivate(instanceId)
-    await this.enqueueResume(instance, 0)
-    await this.appendCockpitLog(instanceId, "Retry requested from cockpit", { action: "retry" })
+    await this.action(instanceId, (run) => run.retry())
   }
 
-  /**
-   * Re-drive a `compensation_failed` instance's compensation: reset the steps
-   * whose compensation/settlement permanently failed (so they re-run), put the
-   * instance back into the `compensating` phase, and enqueue a resume. Already
-   * succeeded compensations stay completed (cache hits), so only the failed ones
-   * are retried — safe because compensations are idempotent.
-   */
   async retryCompensation(instanceId: string): Promise<void> {
-    const instance = await this.requireInstance(instanceId)
-    if (instance.status !== "compensation_failed") {
-      throw badRequest("Retry compensation only applies to compensation_failed instances")
-    }
-
-    // Find the failed internal (compensation/failure) steps to reset.
-    const stepsHash = await this.redis.hgetall(stepsKey(this.prefix, instanceId))
-    const failedInternal = Object.entries(stepsHash)
-      .filter(([, raw]) => {
-        const s = parseStep(raw)
-        return (
-          s !== null &&
-          (s.phase === "compensation" || s.phase === "failure") &&
-          s.status === "failed"
-        )
-      })
-      .map(([field]) => field)
-
-    const [inst, steps, logs] = this.instanceKeys(instanceId)
-    const m = this.redis.multi()
-    if (failedInternal.length > 0) m.hdel(stepsKey(this.prefix, instanceId), ...failedInternal)
-    // Back to compensating + the active set; drop the terminal error/report/TTL.
-    // `failureError` / `failedStep` are kept so the resumed sequence matches the original.
-    m.hdel(inst, "error", "failedAt", "compensation")
-    m.hset(inst, "status", "compensating", "updatedAt", String(Date.now()))
-    m.sadd(activeIndexKey(this.prefix), instanceId)
-    for (const st of TERMINAL_STATUSES) m.zrem(terminalIndexKey(this.prefix, st), instanceId)
-    await m.persist(inst).persist(steps).persist(logs).exec()
-
-    await this.enqueueResume(instance, 0)
-    await this.appendCockpitLog(instanceId, "Retry compensation requested from cockpit", {
-      action: "retry-compensation",
-    })
+    await this.action(instanceId, (run) => run.retryCompensation())
   }
 
   async cancel(instanceId: string): Promise<void> {
-    const instance = await this.requireInstance(instanceId)
-    if (instance.status === "completed" || instance.status === "cancelled") {
-      throw badRequest(`Cannot cancel a ${instance.status} instance`)
-    }
-    // Best-effort removal of the pending tick — correctness does not depend on it,
-    // since any tick that still fires sees the cancelled status and stops.
-    await this.tryRemoveJob(instance.queueName, instance.originalJobId)
-    if (instance.resumeSeq > 0) {
-      await this.tryRemoveJob(
-        instance.queueName,
-        resumeJobId(instance.originalJobId, instance.resumeSeq),
-      )
-    }
-    await this.appendCockpitLog(instanceId, "Cancelled from cockpit", { action: "cancel" })
-    // A real terminal transition, mirroring the runtime. The cockpit can't see the
-    // runtime's configured retention, so it bounds the cancelled state with the
-    // default (see markTerminal — one source of truth for the index/score/TTL).
-    await this.markTerminal(instanceId, "cancelled", DEFAULT_RETENTION_MS.cancelled)
+    await this.action(instanceId, (run) => run.cancel())
   }
 
   async deleteState(instanceId: string): Promise<void> {
-    const instance = await this.requireInstance(instanceId)
-    // Remove any pending tick FIRST. Deleting the state alone would let a still
-    // pending resume tick fire and have the runtime re-create ("resurrect") the
-    // instance from scratch — re-running the whole workflow and re-adding it to the
-    // index. Mirrors cancel's tick removal; only the durable plumbing job is
-    // touched, never business data.
-    await this.tryRemoveJob(instance.queueName, instance.originalJobId)
-    if (instance.resumeSeq > 0) {
-      await this.tryRemoveJob(
-        instance.queueName,
-        resumeJobId(instance.originalJobId, instance.resumeSeq),
-      )
-    }
-    await this.purge(instanceId)
+    await this.action(instanceId, (run) => run.delete())
   }
 
-  // -- Index maintenance (one source of truth for the transition convention) ----
-  //
-  // The cockpit mirrors the runtime's atomic transition here with MULTI/EXEC, so a
-  // concurrent worker tick can't interleave between the status flip and the index
-  // move (a non-transactional pipeline could leave e.g. a live `running` instance
-  // counted as cancelled with an expiry TTL). One helper per transition keeps the
-  // bucket/score/key/TTL convention in a single place, not hand-rolled per call.
-
-  private instanceKeys(id: string): [instance: string, steps: string, logs: string] {
-    return [instanceKey(this.prefix, id), stepsKey(this.prefix, id), logsKey(this.prefix, id)]
-  }
-
-  /** Move an instance into a terminal bucket, scored by expiry, with a TTL (cancel). */
-  private async markTerminal(
+  private async action(
     instanceId: string,
-    status: TerminalStatus,
-    ttl: number,
+    invoke: (run: DurableRun) => Promise<void>,
   ): Promise<void> {
-    const now = Date.now()
-    const [inst, steps, logs] = this.instanceKeys(instanceId)
-    await this.redis
-      .multi()
-      .hset(inst, "status", status, "updatedAt", String(now))
-      .srem(activeIndexKey(this.prefix), instanceId)
-      .zadd(terminalIndexKey(this.prefix, status), now + ttl, instanceId)
-      .pexpire(inst, ttl)
-      .pexpire(steps, ttl)
-      .pexpire(logs, ttl)
-      .exec()
+    const run = await this.resolveRun(instanceId)
+    if (!run) throw notFound(`Durable instance "${instanceId}" not found`)
+    await this.runAction(run, invoke)
   }
 
-  /** Lift an instance back into the active set, clearing every terminal entry + TTL (retry). */
-  private async reactivate(instanceId: string): Promise<void> {
-    const [inst, steps, logs] = this.instanceKeys(instanceId)
-    // The runtime now replay-throws a terminally-`failed` step instead of re-running
-    // it, so a retry that left the failed step in place would immediately re-fail with
-    // the cached error. Delete the failed step records here so they re-run on replay.
-    const stepsHash = await this.redis.hgetall(stepsKey(this.prefix, instanceId))
-    const failedSteps = Object.entries(stepsHash)
-      .filter(([, raw]) => parseStep(raw)?.status === "failed")
-      .map(([field]) => field)
-
-    const m = this.redis.multi()
-    if (failedSteps.length > 0) m.hdel(steps, ...failedSteps)
-    m.hdel(inst, "error", "failedAt", "failureError", "failedStep", "compensation")
-      .hset(inst, "status", "running", "updatedAt", String(Date.now()))
-      .sadd(activeIndexKey(this.prefix), instanceId)
-    for (const st of TERMINAL_STATUSES) m.zrem(terminalIndexKey(this.prefix, st), instanceId)
-    await m.persist(inst).persist(steps).persist(logs).exec()
+  /** Run one durable action, mapping {@link DurableActionError} onto HTTP errors. */
+  private async runAction(
+    run: DurableRun,
+    invoke: (run: DurableRun) => Promise<void>,
+  ): Promise<void> {
+    try {
+      await invoke(run)
+    } catch (error) {
+      if (error instanceof DurableActionError) {
+        throw error.code === "not_found" ? notFound(error.message) : badRequest(error.message)
+      }
+      throw error
+    }
   }
 
-  /** Delete an instance's data keys and remove it from every index set (delete). */
-  private async purge(instanceId: string): Promise<void> {
-    const [inst, steps, logs] = this.instanceKeys(instanceId)
-    const m = this.redis
-      .multi()
-      .del(inst, steps, logs, lockKey(this.prefix, instanceId))
-      .srem(activeIndexKey(this.prefix), instanceId)
-    for (const st of TERMINAL_STATUSES) m.zrem(terminalIndexKey(this.prefix, st), instanceId)
-    await m.exec()
+  // -- Durable-aware routing for the BullMQ surfaces --------------------------
+  // The plain queue/job inspectors route through these when durable is enabled,
+  // so maintenance done from the BullMQ pages keeps run state in lockstep with
+  // the jobs (state follows the job). Queues without durable state pass through
+  // unchanged — the durable follow-ups are no-ops on an empty index.
+
+  /** `Queue.drain` + reconcile/reap of the orphaned non-terminal run state. */
+  async drainQueue(queueName: string): Promise<void> {
+    await this.queueFor(queueName).drain()
+  }
+
+  /** `Queue.clean` + exact state removal for the cleaned jobs. */
+  async cleanQueue(
+    queueName: string,
+    graceMs: number,
+    limit: number,
+    status?: Parameters<Queue["clean"]>[2],
+  ): Promise<void> {
+    await this.queueFor(queueName).clean(graceMs, limit, status)
+  }
+
+  /**
+   * Durable-aware job retry: a run in a terminal-failure status is re-driven
+   * through the runtime — a bare `job.retry()` would only replay the stored
+   * failure without re-running any business code. Returns `false` when the job
+   * carries no such run (including non-terminal ones, where the plain BullMQ
+   * retry IS the correct continuation) — the caller falls back.
+   */
+  async retryRun(queueName: string, jobId: string): Promise<boolean> {
+    const queue = this.queueFor(queueName)
+    const state = await this.store.getInstance(queue.instanceIdFor(jobId))
+    if (state?.status !== "failed" && state?.status !== "compensation_failed") return false
+    // Unseeded handle: the action re-reads state, so a concurrent transition
+    // surfaces as invalid_state instead of acting on a stale snapshot.
+    await this.runAction(queue.run(jobId), (run) =>
+      state.status === "failed" ? run.retry() : run.retryCompensation(),
+    )
+    return true
+  }
+
+  /**
+   * Durable-aware job removal: a job that carries a run is deleted through the
+   * runtime (state + carrier jobs), so no orphan state lingers. Returns `false`
+   * when the job has no durable state — the caller falls back to a plain
+   * `job.remove()`.
+   */
+  async deleteRun(queueName: string, jobId: string): Promise<boolean> {
+    const queue = this.queueFor(queueName)
+    const state = await this.store.getInstance(queue.instanceIdFor(jobId))
+    if (!state) return false
+    await this.runAction(queue.run(jobId, state), (run) => run.delete())
+    return true
   }
 
   // -- Internals -----------------------------------------------------------
-
-  private summarize(
-    instance: StoredInstanceState,
-    steps: StoredStepState[],
-    now: number,
-  ): DurableInstanceSummary {
-    // `toInstanceDetail` reuses the same summary projection; build the detail
-    // and strip the heavy fields to avoid duplicating the derivation logic.
-    const detail = toInstanceDetail(instance, steps, now, this.thresholdMs)
-    const { input: _input, output: _output, error: _error, steps: _steps, ...summary } = detail
-    return summary
-  }
 
   private applyFilters(
     summaries: DurableInstanceSummary[],
@@ -610,94 +478,5 @@ export class DurableInspector {
       const bv = field === "duration" ? (b.durationMs ?? 0) : b[field]
       return (av - bv) * dir
     })
-  }
-
-  private async enqueueResume(instance: StoredInstanceState, delayMs: number): Promise<void> {
-    const seq = await this.allocateResumeSeq(instance.id)
-    const envelope = {
-      [DURABLE_META_KEY]: {
-        instanceId: instance.id,
-        originalJobId: instance.originalJobId,
-        resumeSeq: seq,
-      },
-      payload: instance.input,
-    }
-    await this.getQueue(instance.queueName).add(instance.jobName, envelope, {
-      delay: delayMs,
-      jobId: resumeJobId(instance.originalJobId, seq),
-      attempts: 3,
-      removeOnComplete: true,
-    })
-  }
-
-  /** Atomically allocate the next resume sequence (mirrors the runtime). */
-  private async allocateResumeSeq(instanceId: string): Promise<number> {
-    const key = instanceKey(this.prefix, instanceId)
-    const [seq] = await this.redis
-      .multi()
-      .hincrby(key, "resumeSeq", 1)
-      .hset(key, "updatedAt", String(Date.now()))
-      .exec()
-      .then((res) => [res?.[0]?.[1] as number])
-    return typeof seq === "number" ? seq : Number(seq ?? 0)
-  }
-
-  private async appendCockpitLog(
-    instanceId: string,
-    message: string,
-    meta: Record<string, unknown>,
-  ): Promise<void> {
-    const key = logsKey(this.prefix, instanceId)
-    const entry = JSON.stringify({
-      message,
-      timestamp: Date.now(),
-      meta: { source: "cockpit", ...meta },
-    })
-    await this.redis.multi().rpush(key, entry).ltrim(key, -MAX_COCKPIT_LOGS, -1).exec()
-  }
-
-  private async tryRemoveJob(queueName: string, jobId: string): Promise<void> {
-    try {
-      const job = await this.getQueue(queueName).getJob(jobId)
-      if (job) await job.remove().catch(() => undefined)
-    } catch {
-      // Best effort.
-    }
-  }
-
-  private async loadInstance(instanceId: string): Promise<StoredInstanceState | null> {
-    const hash = await this.redis.hgetall(instanceKey(this.prefix, instanceId))
-    return parseInstanceHash(hash)
-  }
-
-  private async requireInstance(instanceId: string): Promise<StoredInstanceState> {
-    const instance = await this.loadInstance(instanceId)
-    if (!instance) throw notFound(`Durable instance "${instanceId}" not found`)
-    return instance
-  }
-
-  private async loadSteps(instanceId: string): Promise<StoredStepState[]> {
-    const hash = await this.redis.hgetall(stepsKey(this.prefix, instanceId))
-    return Object.values(hash)
-      .map(parseStep)
-      .filter((s): s is StoredStepState => s !== null)
-      .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
-  }
-
-  private async loadStepsFor(instanceIds: string[]): Promise<Map<string, StoredStepState[]>> {
-    const byId = new Map<string, StoredStepState[]>()
-    if (instanceIds.length === 0) return byId
-    const pipeline = this.redis.pipeline()
-    for (const id of instanceIds) pipeline.hgetall(stepsKey(this.prefix, id))
-    const results = await pipeline.exec()
-    results?.forEach(([err, hash], index) => {
-      if (err) return
-      const steps = Object.values(hash as Record<string, string>)
-        .map(parseStep)
-        .filter((s): s is StoredStepState => s !== null)
-        .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
-      byId.set(instanceIds[index]!, steps)
-    })
-    return byId
   }
 }

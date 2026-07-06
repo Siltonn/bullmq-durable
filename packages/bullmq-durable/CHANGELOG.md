@@ -5,6 +5,170 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-04
+
+**One run = one BullMQ job.** The resume-job architecture is gone: suspensions
+(`ctx.sleep`, step backoff, `retryLater`) now use BullMQ's native step-jobs
+pattern (`job.moveToDelayed` + `DelayedError`) on the run's own job. BullMQ's
+own options — `attempts`, `backoff`, `priority`, `removeOnComplete`,
+`removeOnFail`, `keepLogs` — apply to the whole run, natively.
+
+### Changed
+
+- **`cancel(jobId)` aligns with BullMQ's cancellation boundary**: existing
+  state is marked cancelled (the run stops at its next checkpoint); when no
+  durable state exists yet the job is best-effort removed and NO cancelled
+  state is fabricated — an already active/locked job cannot be force-stopped
+  from outside, exactly as in BullMQ.
+- **`clean()` follows up with a reconcile pass**: removed ids that don't map
+  1:1 onto instance ids (e.g. a 0.1.x legacy resume job) are collected by the
+  reaper instead of being parsed heuristically.
+- **Boundary-error classification is module-instance-proof**: the
+  `failed`-listener now identifies `DurableTerminalJobError` /
+  `DurableCancelledJobError` via `isDurableBoundaryError` (exported) — a
+  `Symbol.for` marker plus class-name fallback on top of `instanceof` — so a
+  duplicated bullmq-durable copy (CJS/ESM dual package) cannot demote a
+  settled run into a spurious settle tick or a mistimed one.
+- **`bullJobKeysExist`** (renamed from `bullJobsExist`): runtime-guards the Redis client instead of
+  blindly asserting `exists`, pipelines the per-key `EXISTS` calls into one
+  round trip when supported, and treats per-key errors as "existing" so
+  uncertainty can never reap live state.
+(breaking, with a soft landing)
+
+- **Job dispatch**: no more resume jobs / `__durable__` envelopes / `:resume:N`
+  job ids. The run's job stays visible (`delayed` while sleeping) for its whole
+  life; `waitUntilFinished` now resolves at TRUE completion (previously it
+  resolved at the first yield).
+- **Two retry budgets**: step errors are governed by the step's own `retry`
+  (never consuming job attempts — the old "keep BullMQ `attempts: 1`" advice is
+  inverted: set `attempts`/`backoff` freely, they retry *non-step* errors with
+  replay making re-execution safe). Terminal failures throw
+  `DurableTerminalJobError` / `DurableCancelledJobError` (both
+  `UnrecoverableError`s) so BullMQ never burns attempts on settled runs.
+- **State lifecycle follows the job** (`RetentionOptions` removed): durable
+  state lives exactly as long as its BullMQ job. `removeOnComplete` /
+  `removeOnFail` (every form) govern the run record; the runtime reaps state
+  whose job is gone — eventually consistent by design: reap passes run on
+  worker start, terminal outcomes, reads, and explicit `reconcile()`; external
+  BullMQ-direct deletions converge at the next trigger. `DurableQueue.clean()` /
+  `drain()` / `obliterate()` pass through to BullMQ and delete the matching
+  state. ⚠️ `removeOnFail: true` now erases `compensation_failed` records too —
+  keep failed jobs with `{ age }` / `{ count }`.
+- **Logs live in the BullMQ job log**: `ctx.log` writes tagged JSON lines
+  (`"$durable":1`) with run/step/attempt attribution; the runtime auto-logs
+  failure-path events. Bound them with `defaultJobOptions.keepLogs`; read via
+  `queue.getDurableLogs()` / `parseJobLogs()`. The 0.1.x durable log list is
+  gone (leftovers are cleaned by the reaper).
+- **Options ARE BullMQ options**: `DurableQueueOptions extends QueueOptions`,
+  `DurableWorkerOptions extends WorkerOptions` (`concurrency`, `lockDuration`,
+  `stalledInterval`, `limiter`, `settings.backoffStrategy`, … pass through).
+  Deprecated 0.1.x fields are still accepted with a one-shot warning and are
+  removed in 0.3.0: `bullPrefix` → `prefix`, `bullWorkerOptions` → top level;
+  `lockTimeout`, `retention`, `maxLogs`, `resumeAttempts` are ignored. The flat
+  retry shape `{ backoff: "exponential", delay, maxDelay }` still works; prefer
+  `backoff: { type, delay, jitter, maxDelay }` (BullMQ's vocabulary).
+- **Step retry shape**: `retry.backoff` now mirrors BullMQ's `backoff` option
+  (number / duration string / `{ type, delay, jitter, maxDelay }`), including
+  jitter semantics.
+- **NestJS**: root/registration options gain `prefix`, `defaultJobOptions` and
+  `workerOptions` (a `WorkerOptions` sub-object); the module now closes every
+  queue/store it created (including per-queue `durablePrefix` stores) and also
+  implements `OnApplicationShutdown`.
+- **Custom `StateStore` interface** (for store authors): `initInstance` gained
+  begin-tick semantics, new `beginStep` + reaper primitives (`listActive`,
+  `listOldestTerminal`, `removeInstances`, `wipeAll`), lock-token-fenced
+  terminal transitions; `appendLog`/`getLogs`/`nextResumeSeq`/`expireInstance`
+  removed.
+
+### Added
+
+- **`DurableRun` + the run collection on `DurableQueue`** — the public object
+  model mirrors BullMQ's own `Queue`/`Job` split, so dashboards, ops scripts
+  and application code call methods instead of hand-mirroring the Redis
+  layout. `DurableQueue` owns the collection: `run(jobId)` / `getRun` vend
+  handles, `listRuns` (index windows) / `countRuns` / `activeRuns` /
+  `summarizeRuns` / `reconcile` read it, and an injectable `bull` option
+  reuses a host-held BullMQ `Queue`. `DurableRun` is the run-scoped entity:
+  `state` / `steps` / `logs` / `events` / `summary`, `carrier` /
+  `carrierState` (0.1.x legacy-fallback resolution built in, single source),
+  and the actions `resume` / `retry` / `retryCompensation` / `cancel` /
+  `delete`. Action errors are `DurableActionError` with a `code`
+  (`not_found` / `invalid_state`) for clean HTTP mapping. The semantic layer
+  ships alongside (`deriveView`, `classifyLocalStuck`, `synthesizeEvents`,
+  `sleepWakeAt`, batch `summarizeInstances`) — `bullmq-cockpit` 0.2.0
+  consumes exactly this API and no longer mirrors the protocol by hand.
+- **Deployment detection for dashboards**: `DurableWorker` announces its queue
+  in the `{prefix}:queues` registry at startup (idempotent
+  `StateStore.registerQueue`), so a durable deployment is detectable BEFORE
+  the first run ever ticks; `durableProbeKeys(prefix)` exports the marker keys
+  (current + 0.1.x legacy) so dashboards can probe with one variadic `EXISTS`
+  on their own client — no layout knowledge, no SCAN. `RedisStateStore` now
+  dials Redis lazily on first command (constructing a store — e.g. just to
+  probe — no longer costs a connection).
+- **NestJS: `DURABLE_QUEUE_NAMES`** — an exported injection token resolving to
+  a lazy `() => string[]` of every queue registered through
+  `DurableBullModule.registerQueue(Async)`. Wire it into dashboards (e.g.
+  `BullMQCockpitModule.forRootAsync`'s `queues`) so durable-registered queues
+  appear without a second registration.
+- **Top-level `{ run, onFailure }` processor**: `DurableWorker` now accepts a
+  default handler object alongside the single-function and per-name-map forms —
+  for the "one queue = one workflow" shape, `onFailure` pairs with the
+  processor instead of hiding in worker options. `run` becomes a reserved word
+  in the map form (a job actually named "run" uses `{ run: { run: fn } }`).
+- **Exact terminal pagination**: `DurableQueue.listRunsPage({ kind, offset,
+  limit, order? })` pages one done bucket by terminal-transition time via a
+  real zset offset (`StateStore.listTerminalPage` primitive) — deep pagination
+  stays exact, unlike the recency-window `listRuns`.
+- **Injection & tuning options**: `DurableQueueOptions.bullmq` reuses a
+  host-held BullMQ `Queue` (ownership stays with the caller), and
+  `reaper: { terminalBatchSize, throttleMs, orphanGraceMs }` tunes the state
+  reaper on both queue and worker (terminal batch default raised 8 → 32;
+  orphan grace default 10s).
+- **Per-queue status index**: `{prefix}:idx:{queue}:active` and
+  `{prefix}:idx:{queue}:done:{status}` (plus a `{prefix}:queues` registry)
+  replace the global buckets — each bucket now scales with ONE queue's own
+  `removeOn*` retention (the same order as BullMQ's per-queue zsets), busy
+  neighbours can't bloat another queue's scans, and `obliterate`/wipes drain
+  chunked instead of materialising whole buckets. Pre-release global buckets
+  are read + reaped during a transition window (removed in 0.3.0).
+
+### Fixed
+
+- `ctx.sleep` crash window: a sleep is now persisted as `running` + `nextRunAt`
+  and completes only once elapsed — a crash between persisting and suspending
+  can no longer skip the wait on re-delivery. Step backoffs are honoured the
+  same way on early re-delivery (stall takeover / promote).
+- Concurrent steps (`Promise.all`): the runtime now waits for detached sibling
+  steps to settle before finalising a tick, eliminating stray writes and
+  unhandled rejections after the first yield unwinds.
+- Terminal transitions are fenced by the instance-lock token (a zombie worker
+  that lost a stall takeover can no longer flip state); step-seq allocation
+  fails loudly on Redis errors instead of silently reusing `0`; corrupted JSON
+  fields report the instance/field instead of an anonymous `SyntaxError`.
+- Stall-death settlement: jobs that die without reaching the processor (stalled
+  past `maxStalledCount`) or crash mid-settlement are settled by a
+  `failed`-event listener — compensation still runs (replay-only forward pass,
+  no new side effects).
+- NestJS: per-queue stores created by a `durablePrefix` override are closed on
+  shutdown (previously leaked their connection).
+
+### Migration (0.1.x → 0.2.0)
+
+Rolling upgrade is supported — no drain needed. In-flight 0.1.x resume jobs
+(even ones sleeping for days) are adopted by a built-in shim and continue under
+the new mechanics; `cancel()` still finds legacy carriers. Upgrade
+`bullmq-cockpit` to 0.2.0 in the same rollout. Remove any `attempts: 1` set on
+the old advice. The shim and all deprecated aliases are removed in 0.3.0.
+
+### Removed
+
+- **Dead error exports**: `DurableTimeoutError` (declared since 0.1.x, never
+  thrown by anything) and the trivial guards `isYieldError` /
+  `isRetryLaterError` / `isDurableControlSignal` — use `instanceof` on the
+  classes. All durable-thrown errors except the two BullMQ boundary errors now
+  extend `DurableError` (`SettleIncompleteError` and `DurableActionError`
+  joined the family), so `err instanceof DurableError` is the one catch-all.
+
 ## [0.1.5] - 2026-06-30
 
 ### Changed

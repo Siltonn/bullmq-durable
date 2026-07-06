@@ -119,7 +119,7 @@ export interface ClientServer {
 export function registerClient(
   app: Hono<any>,
   clientDir: string | null,
-  buildConfig: (c: Context) => CockpitConfig,
+  buildConfig: (c: Context) => CockpitConfig | Promise<CockpitConfig>,
   authGuard: MiddlewareHandler,
 ): ClientServer {
   const root = resolveClientDir(clientDir)
@@ -151,7 +151,7 @@ export function registerClient(
       const body = await readFile(target)
       return c.body(body, 200, { "Content-Type": contentType(target) })
     }
-    const html = injectConfig(indexHtml, buildConfig(c))
+    const html = injectConfig(indexHtml, await buildConfig(c))
     return c.html(html, 200, { "Cache-Control": "no-cache" })
   })
 

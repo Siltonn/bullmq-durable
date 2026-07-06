@@ -14,6 +14,24 @@ retry / resume controls, and stuck detection.
 - **Client**: React + Vite + TanStack Router/Query/Table + HeroUI + Tailwind.
 - **Adapters**: Express, Fastify, NestJS, and a standalone CLI.
 
+## At a glance
+
+```yaml
+package: bullmq-cockpit          # embeddable dashboard; publishes UI + server + CLI
+version: 0.2.0                   # versioned in lockstep with bullmq-durable
+requires: node >=18, bullmq ^5, a reachable Redis
+install: npm i bullmq-cockpit    # or: npx bullmq-cockpit --redis redis://…
+works-with:
+  plain-bullmq: first-class      # queues/jobs/flows/schedulers/metrics/alerts, no durable needed
+  bullmq-durable: auto-detected  # consumes the runtime package via its DurableQueue/DurableRun API
+durable-protocol: 0.2.x          # one run = one job; sleeping runs are `delayed` jobs
+security:
+  auth: open by default          # startup WARNING unless `auth` or `readonly` is set
+  queue-names: validated         # unknown client-supplied queue names → 404 (no Redis pollution)
+  readonly: strips every write permission
+api: tRPC under {basePath}/api/trpc (AppRouter type exported)
+```
+
 ---
 
 ## Features
@@ -96,11 +114,13 @@ import { BullMQCockpitModule } from "bullmq-cockpit/nestjs"
 
 @Module({
   imports: [
-    BullMQCockpitModule.register({ path: "/admin/bullmq", connection, queues: ["emails"] }),
+    BullMQCockpitModule.forRoot({ path: "/admin/bullmq", connection, queues: ["emails"] }),
   ],
 })
 export class AdminModule {}
 ```
+
+(`register` / `registerAsync` remain as aliases of `forRoot` / `forRootAsync`.)
 
 Under NestJS the dashboard **never auto-discovers** queues by scanning Redis — you
 declare them explicitly. List them at the root with `queues`, and/or contribute
@@ -114,20 +134,36 @@ them from any feature module with `registerQueue` (mirrors
 export class MediaModule {}
 ```
 
-Source `connection` (and `auth`) from DI with `registerAsync`:
+Source `connection` (and `auth`, and queue names) from DI with `forRootAsync` —
+`queues` also accepts a thunk, read lazily per request and merged with the
+`registerQueue` names, so any source plugs in:
 
 ```ts
 @Module({
   imports: [
-    BullMQCockpitModule.registerAsync({
+    BullMQCockpitModule.forRootAsync({
       path: "/admin/bullmq",
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+      useFactory: (config: ConfigService) => ({
+        connection: config.get("redis"),
+        queues: () => config.get("queueNames"),
+      }),
     }),
   ],
 })
 export class AdminModule {}
+```
+
+Using `bullmq-durable` in the same app? Inject its `DURABLE_QUEUE_NAMES` thunk
+and the dashboard shows exactly the queues you registered with
+`DurableBullModule.registerQueue` — zero double-registration:
+
+```ts
+BullMQCockpitModule.forRootAsync({
+  inject: [DURABLE_QUEUE_NAMES], // from "bullmq-durable/nestjs"
+  useFactory: (names: () => string[]) => ({ connection, queues: names }),
+})
 ```
 
 The cockpit's Redis connections are built lazily and released automatically on
@@ -157,13 +193,13 @@ const { app, context } = createCockpitApp({ connection })
 | Option              | Default            | Description                                                           |
 | ------------------- | ------------------ | -------------------------------------------------------------------- |
 | `connection`        | —                  | BullMQ/ioredis connection (options or a client). **Required.**       |
-| `queues`            | auto-discover      | Explicit queue allow-list.                                           |
+| `queues`            | auto-discover      | Explicit queue allow-list. Client-supplied queue names are always validated against this list (or the discovered set) — unknown names get a 404 instead of creating BullMQ keys. |
 | `bullPrefix`        | `"bull"`           | BullMQ key prefix.                                                   |
 | `basePath`          | inferred           | Mount path; adapters usually infer it.                              |
 | `durable.enabled`   | `true`             | Enable the durable instance inspector.                              |
 | `durable.prefix`    | `"bullmq-durable"` | `bullmq-durable` Redis key prefix.                                  |
 | `durable.stuckThresholdMs` | `300000`    | Staleness threshold for stuck detection.                            |
-| `auth`              | open               | Authorization hook (see below). **Set this in production.**         |
+| `auth`              | open               | Authorization hook (see below). **Set this in production** — without it (and without `readonly`) the server logs a startup warning. |
 | `readonly`          | `false`            | Disable every mutating action.                                      |
 
 ### Auth & permissions
@@ -195,22 +231,31 @@ In `readonly` mode every write permission is stripped regardless of the hook.
 
 When durable support is on, the **Durable** section lists instances with their
 derived status (the runtime's coarse `yielded` is split into `sleeping`,
-`retrying`, `waiting`). The detail view shows:
+`retrying`, `waiting`). Under the 0.2.x protocol **one run rides one BullMQ
+job** — a sleeping run is simply that job parked in the `delayed` set, and every
+action drives that job with BullMQ's own primitives. The detail view shows:
 
 - a **step timeline** (`✓ completed · 421ms`, `↻ retrying · attempt 12 · next in 8s`, …),
   with `ROLLBACK` / `SETTLE` tags for compensation and `onFailure` steps,
 - per-step result previews, errors, and timings,
-- input / output / logs / a synthesized event feed,
-- **Resume now**, **Retry**, **Cancel**, and **Delete state** actions.
+- input / output / a synthesized event feed,
+- **attributed logs**: `ctx.log` lines carry which delivery (`Delivery #2`),
+  which step + attempt (`charge-card#2`), and runtime failure events
+  (`step_retry`, `settled`, …) — multi-delivery runs read as separate sections
+  instead of one merged stream,
+- **Resume now** (promotes the delayed job, or revives it by id if it was
+  removed), **Retry**, **Retry compensation**, **Cancel**, and **Delete state**.
 
-**Saga compensation** (`bullmq-durable` ≥ 0.1.3) is first-class: the `compensating`
+**Saga compensation** is first-class: the `compensating`
 and `compensation_failed` statuses appear in the Overview summary, status filter,
 and counts. A `compensation_failed` instance shows a "manual intervention needed"
 banner with its compensation report (what rolled back vs. failed) and a **Retry
 compensation** action that re-runs only the failed compensation steps.
 
-The **Health** page surfaces stuck instances in four classes: `running_stale`,
-`resume_missed`, `orphan_resume_job`, and `orphan_instance`.
+The **Health** page surfaces stuck instances by class: `running_stale`,
+`resume_missed`, `orphan_instance` (the run's job is missing — hand-deleted —
+or `failed` with settlement unfinished), and the legacy `orphan_resume_job`
+(0.1.x envelope ticks during a rolling upgrade; removed in 0.3.0).
 
 ## API (tRPC)
 
@@ -266,8 +311,9 @@ The seed creates a realistic spread so **every** view has something to show:
 | ------------------------ | -------------------------------------------------------- |
 | `emails`, `payments`     | completed + failed jobs (with stacktraces)               |
 | `notifications`, `exports-csv` | waiting + delayed jobs                             |
-| `generation` (durable)   | completed, sleeping, retrying, failed, cancelled — plus a stuck `running_stale` instance and an `orphan_resume_job` (so the **Health** page lights up) |
+| `generation` (durable)   | completed, a **flaky-step retry history**, sleeping, retrying, failed, **saga compensation** (rolled-back / `compensation_failed` / parked `compensating`), a **job-level backoff** run (waiting out BullMQ attempts), cancelled — plus `running_stale`, a legacy `orphan_resume_job`, and a legacy shim-carried run |
 | `exports` (durable)      | a second durable queue (completed + sleeping)            |
+| `media` (durable)        | a 6-step pipeline: completed (+ a synthesized waterfall showcase), sleeping, failed deep in `transcode`, retrying with a live delayed carrier, `resume_missed`, and an `orphan_instance` |
 
 ### Pointing at your own data
 
