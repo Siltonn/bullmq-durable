@@ -19,6 +19,7 @@ import { DurableExplorer } from "./explorer"
 import { createSharedStore, reuseSharedStore } from "./shared-store"
 import {
   DURABLE_BULL_OPTIONS,
+  DURABLE_QUEUE_NAMES,
   DURABLE_STATE_STORE,
   getDurableQueueOptionsToken,
   getDurableQueueToken,
@@ -29,6 +30,23 @@ import type {
   DurableQueueAsyncRegistration,
   DurableQueueRegistration,
 } from "./types"
+
+/**
+ * Accumulates the names of queues registered via `registerQueue(Async)`.
+ * Provided (and exported) by the root module; each registration's eager
+ * factory feeds it, and {@link DURABLE_QUEUE_NAMES} reads it lazily.
+ */
+export class DurableQueueNamesRegistry {
+  private readonly names = new Set<string>()
+
+  add(...names: string[]): void {
+    for (const name of names) this.names.add(name)
+  }
+
+  all(): string[] {
+    return [...this.names]
+  }
+}
 
 @Module({})
 export class DurableBullModule {
@@ -64,6 +82,7 @@ export class DurableBullModule {
       })
       this.collectQueueProviders(registration.name, registration.processor, providers, exported)
     }
+    providers.push(this.namesRegistration(queues.map((q) => q.name)))
 
     return { module: DurableBullModule, providers, exports: exported as string[] }
   }
@@ -88,8 +107,22 @@ export class DurableBullModule {
       })
       this.collectQueueProviders(name, registration.processor, providers, exported)
     }
+    providers.push(this.namesRegistration(queues.map((q) => q.name)))
 
     return { module: DurableBullModule, imports, providers, exports: exported as string[] }
+  }
+
+  /** Eagerly feed this registration's queue names into the shared registry. */
+  private static namesRegistration(names: string[]): Provider {
+    return {
+      // Unique token per call so multiple registrations never collide.
+      provide: Symbol("DURABLE_QUEUE_NAMES_REGISTRATION"),
+      useFactory: (registry: DurableQueueNamesRegistry): string[] => {
+        registry.add(...names)
+        return names
+      },
+      inject: [DurableQueueNamesRegistry],
+    }
   }
 
   /** Shared root module shape for {@link forRoot} / {@link forRootAsync}. */
@@ -112,8 +145,19 @@ export class DurableBullModule {
           inject: [DURABLE_BULL_OPTIONS],
         },
         DurableExplorer,
+        DurableQueueNamesRegistry,
+        {
+          provide: DURABLE_QUEUE_NAMES,
+          useFactory: (registry: DurableQueueNamesRegistry) => () => registry.all(),
+          inject: [DurableQueueNamesRegistry],
+        },
       ],
-      exports: [DURABLE_BULL_OPTIONS, DURABLE_STATE_STORE],
+      exports: [
+        DURABLE_BULL_OPTIONS,
+        DURABLE_STATE_STORE,
+        DurableQueueNamesRegistry,
+        DURABLE_QUEUE_NAMES,
+      ],
     }
   }
 

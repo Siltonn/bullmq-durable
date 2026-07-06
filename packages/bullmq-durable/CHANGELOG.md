@@ -97,6 +97,11 @@ own options — `attempts`, `backoff`, `priority`, `removeOnComplete`,
   ships alongside (`deriveView`, `classifyLocalStuck`, `synthesizeEvents`,
   `sleepWakeAt`, batch `summarizeInstances`) — `bullmq-cockpit` 0.2.0
   consumes exactly this API and no longer mirrors the protocol by hand.
+- **NestJS: `DURABLE_QUEUE_NAMES`** — an exported injection token resolving to
+  a lazy `() => string[]` of every queue registered through
+  `DurableBullModule.registerQueue(Async)`. Wire it into dashboards (e.g.
+  `BullMQCockpitModule.forRootAsync`'s `queues`) so durable-registered queues
+  appear without a second registration.
 - **Top-level `{ run, onFailure }` processor**: `DurableWorker` now accepts a
   default handler object alongside the single-function and per-name-map forms —
   for the "one queue = one workflow" shape, `onFailure` pairs with the

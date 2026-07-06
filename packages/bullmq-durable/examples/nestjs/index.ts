@@ -77,6 +77,17 @@ export class GenerationService {
 })
 export class GenerationModule {}
 
+// --- Dashboard --------------------------------------------------------------
+// Mounting bullmq-cockpit in the same app? Inject DURABLE_QUEUE_NAMES so the
+// dashboard shows exactly the queues registered above — no second list:
+//
+//   BullMQCockpitModule.forRootAsync({
+//     inject: [DURABLE_QUEUE_NAMES],
+//     useFactory: (names: () => string[]) => ({ connection, queues: names }),
+//   })
+//
+// (Full example: bullmq-cockpit/examples/nestjs.)
+
 // --- Fake helpers (replace with real ones) ----------------------------------
 
 async function createTask(_input: CreateVideoInput): Promise<{ id: string }> {

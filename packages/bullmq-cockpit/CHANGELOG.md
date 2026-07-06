@@ -32,6 +32,13 @@ upgrade.
   queue and the default recency sort the offset is pushed down to Redis, so
   deep pages stay exact with no hard cap; cross-queue listings merge exact
   per-queue pages.
+- **NestJS: `forRoot` / `forRootAsync`** are the canonical module methods
+  (mirroring `BullModule.forRoot`); `register` / `registerAsync` remain as
+  aliases. The adapter no longer swallows a `queues` THUNK passed through the
+  root options — it is read lazily per request and merged with
+  `registerQueue` names, so any queue-name source plugs in (a ConfigService,
+  or `bullmq-durable`'s new `DURABLE_QUEUE_NAMES` for zero
+  double-registration when both modules run in one app).
 - **Queue-name validation**: every client-supplied queue name is validated
   against the discovered/allow-listed set (404 for unknown names) — an
   arbitrary name can no longer create BullMQ meta keys or grow the queue

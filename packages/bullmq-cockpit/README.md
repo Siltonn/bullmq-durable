@@ -114,11 +114,13 @@ import { BullMQCockpitModule } from "bullmq-cockpit/nestjs"
 
 @Module({
   imports: [
-    BullMQCockpitModule.register({ path: "/admin/bullmq", connection, queues: ["emails"] }),
+    BullMQCockpitModule.forRoot({ path: "/admin/bullmq", connection, queues: ["emails"] }),
   ],
 })
 export class AdminModule {}
 ```
+
+(`register` / `registerAsync` remain as aliases of `forRoot` / `forRootAsync`.)
 
 Under NestJS the dashboard **never auto-discovers** queues by scanning Redis — you
 declare them explicitly. List them at the root with `queues`, and/or contribute
@@ -132,20 +134,36 @@ them from any feature module with `registerQueue` (mirrors
 export class MediaModule {}
 ```
 
-Source `connection` (and `auth`) from DI with `registerAsync`:
+Source `connection` (and `auth`, and queue names) from DI with `forRootAsync` —
+`queues` also accepts a thunk, read lazily per request and merged with the
+`registerQueue` names, so any source plugs in:
 
 ```ts
 @Module({
   imports: [
-    BullMQCockpitModule.registerAsync({
+    BullMQCockpitModule.forRootAsync({
       path: "/admin/bullmq",
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({ connection: config.get("redis") }),
+      useFactory: (config: ConfigService) => ({
+        connection: config.get("redis"),
+        queues: () => config.get("queueNames"),
+      }),
     }),
   ],
 })
 export class AdminModule {}
+```
+
+Using `bullmq-durable` in the same app? Inject its `DURABLE_QUEUE_NAMES` thunk
+and the dashboard shows exactly the queues you registered with
+`DurableBullModule.registerQueue` — zero double-registration:
+
+```ts
+BullMQCockpitModule.forRootAsync({
+  inject: [DURABLE_QUEUE_NAMES], // from "bullmq-durable/nestjs"
+  useFactory: (names: () => string[]) => ({ connection, queues: names }),
+})
 ```
 
 The cockpit's Redis connections are built lazily and released automatically on
