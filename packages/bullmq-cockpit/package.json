@@ -5,6 +5,13 @@
   "type": "module",
   "license": "MIT",
   "author": "elmer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Siltonn/bullmq-durable.git",
+    "directory": "packages/bullmq-cockpit"
+  },
+  "homepage": "https://github.com/Siltonn/bullmq-durable/tree/main/packages/bullmq-cockpit#readme",
+  "bugs": "https://github.com/Siltonn/bullmq-durable/issues",
   "keywords": [
     "bullmq",
     "redis",

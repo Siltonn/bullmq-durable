@@ -6,6 +6,12 @@
   "license": "MIT",
   "author": "elmer",
   "description": "Durable execution for BullMQ + a modern dashboard and durable instance inspector.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Siltonn/bullmq-durable.git"
+  },
+  "homepage": "https://github.com/Siltonn/bullmq-durable#readme",
+  "bugs": "https://github.com/Siltonn/bullmq-durable/issues",
   "packageManager": "pnpm@11.3.0",
   "engines": {
     "node": ">=22.13"

@@ -6,21 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 It is versioned in lockstep with [`bullmq-durable`](../bullmq-durable).
 
-## [Unreleased]
-
-### Fixed
-
-- **Durable-aware queue/job actions on the BullMQ pages**: with durable
-  enabled, queue `drain` / `clean` now route through
-  `DurableQueue.drain/clean` — a bare `Queue.drain/clean` stranded the
-  removed jobs' run state (phantom active runs / orphaned terminal state
-  until a worker restart). Job **remove** deletes the run through
-  `DurableRun.delete` (state + carrier jobs), and job **retry** of a
-  terminally-failed run re-drives it through the runtime (`run.retry()` /
-  `run.retryCompensation()`) instead of silently replaying the stored
-  failure without re-running any business code. Non-durable queues and runs
-  in non-terminal statuses keep the plain BullMQ behavior.
-
 ## [0.2.0] - 2026-07-04
 
 Tracks `bullmq-durable` 0.2.0's "one run = one job" protocol. Deploy the two
@@ -91,6 +76,19 @@ upgrade.
   parked sleeps as "sleeping until …" instead of "scheduled to retry".
 - List/detail reads self-heal the index: listed ids whose instance hash is gone
   are dropped from the index buckets on read.
+
+### Fixed
+
+- **Durable-aware queue/job actions on the BullMQ pages**: with durable
+  enabled, queue `drain` / `clean` now route through
+  `DurableQueue.drain/clean` — a bare `Queue.drain/clean` stranded the
+  removed jobs' run state (phantom active runs / orphaned terminal state
+  until a worker restart). Job **remove** deletes the run through
+  `DurableRun.delete` (state + carrier jobs), and job **retry** of a
+  terminally-failed run re-drives it through the runtime (`run.retry()` /
+  `run.retryCompensation()`) instead of silently replaying the stored
+  failure without re-running any business code. Non-durable queues and runs
+  in non-terminal statuses keep the plain BullMQ behavior.
 
 ## [0.1.5] - 2026-06-30
 
